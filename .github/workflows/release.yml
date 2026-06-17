@@ -40,17 +40,36 @@ jobs:
 
       - name: Package
         shell: bash
+        # cd into the output dir first so the archive holds a *bare* `quotaline[.exe]`
+        # (the installers extract it directly — no nested target/.../release/ path).
         run: |
           name="quotaline-${{ matrix.target }}"
+          cd "target/${{ matrix.target }}/release"
           if [ "${{ matrix.os }}" = "windows-latest" ]; then
-            7z a "${name}.zip" "./target/${{ matrix.target }}/release/quotaline.exe"
-            echo "ASSET=${name}.zip" >> "$GITHUB_ENV"
+            7z a "$GITHUB_WORKSPACE/${name}.zip" quotaline.exe
           else
-            tar -czf "${name}.tar.gz" -C "target/${{ matrix.target }}/release" quotaline
-            echo "ASSET=${name}.tar.gz" >> "$GITHUB_ENV"
+            tar -czf "$GITHUB_WORKSPACE/${name}.tar.gz" quotaline
           fi
 
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: quotaline-${{ matrix.target }}.*
+          if-no-files-found: error
+
+  # A single publish job (after all builds) so the release is created once — no concurrent
+  # action-gh-release calls racing to create the same tag's release.
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
       - name: Attach to release
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ env.ASSET }}
+          files: dist/*

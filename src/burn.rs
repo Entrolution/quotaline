@@ -132,6 +132,9 @@ fn sum_session_delta<F: Fn(&Sample) -> Option<f64>>(
     let mut by_sid: HashMap<Option<String>, (f64, f64)> = HashMap::new();
     for e in entries {
         if let Some(v) = extract(e) {
+            if !v.is_finite() {
+                continue; // a NaN/inf would poison the running min/max
+            }
             let slot = by_sid.entry(e.sid.clone()).or_insert((v, v));
             if v < slot.0 {
                 slot.0 = v;
@@ -178,7 +181,7 @@ pub fn analyze(hist: &[Sample], win: Win, window_sec: f64, now: f64) -> Option<A
                 sum_session_delta(&window_entries, |s| s.tout.map(|v| v as f64)).unwrap_or(0.0);
             let tok = tin + tout;
             conv = Some(Conv {
-                usd_per_pct: usd.filter(|u| *u != 0.0).map(|u| u / d_pct),
+                usd_per_pct: usd.filter(|u| u.is_finite() && *u > 0.0).map(|u| u / d_pct),
                 tok_per_pct: if tok > 0.0 { Some(tok / d_pct) } else { None },
             });
         }

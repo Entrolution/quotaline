@@ -26,12 +26,29 @@ fn memory_path(transcript_path: &str) -> Option<PathBuf> {
     Some(parent.join("memory").join("MEMORY.md"))
 }
 
+/// Max bytes to read — far above any sane MEMORY.md. Bounds the live-render read so a
+/// pathologically huge file can't OOM the status line; combined with the `is_file` check it
+/// also avoids ever blocking on a pipe. The gauge only needs ~the first 200 lines / 25k units.
+const READ_CAP: u64 = 1 << 20; // 1 MiB
+
 /// Measure the current project's MEMORY.md, or `None` if there is no transcript path or file.
 pub fn measure(transcript_path: Option<&str>) -> Option<MemStat> {
+    use std::io::Read;
     let path = memory_path(transcript_path?)?;
-    let content = std::fs::read_to_string(path).ok()?;
+    // Guard the live render path: only a regular file (metadata/stat never blocks), and a
+    // bounded read — so a FIFO can't hang the line and a huge file can't OOM it.
+    if !std::fs::metadata(&path).ok()?.is_file() {
+        return None;
+    }
+    let mut content = String::new();
+    std::fs::File::open(&path)
+        .ok()?
+        .take(READ_CAP)
+        .read_to_string(&mut content)
+        .ok()?;
     Some(MemStat {
-        lines: content.lines().count(),
+        // split('\n') (not lines()) matches the JS line count Claude Code truncates on.
+        lines: content.split('\n').count(),
         chars: content.encode_utf16().count(),
     })
 }

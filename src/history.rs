@@ -124,7 +124,9 @@ pub fn log_sample(dir: &Path, input: &Value, now: i64) {
     // rename is atomic, so the worst case is a dropped sample, never a corrupt file.
     let tmp = dir.join(format!("usage-history.{}.json.tmp", std::process::id()));
     if fs::write(&tmp, json).is_ok() {
-        let _ = fs::rename(&tmp, history_path(dir));
+        if fs::rename(&tmp, history_path(dir)).is_err() {
+            let _ = fs::remove_file(&tmp); // don't leave an orphan temp on rename failure
+        }
     } else {
         let _ = fs::remove_file(&tmp);
     }

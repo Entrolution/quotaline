@@ -19,10 +19,13 @@ fn settings_path() -> Option<PathBuf> {
     home_dir().map(|h| h.join(".claude").join("settings.json"))
 }
 
-/// Quote the command path for the shell Claude Code runs it in (only if it has whitespace).
+/// Quote the binary path for the shell Claude Code runs the command in. Bare when it has no
+/// whitespace; otherwise double-quoted. Backslashes are left literal (Windows paths need them;
+/// serde handles JSON escaping); an embedded `"` (illegal in Windows paths, pathological on
+/// POSIX) is escaped for POSIX shells.
 fn quote_cmd(path: &str) -> String {
     if path.chars().any(char::is_whitespace) {
-        format!("\"{path}\"")
+        format!("\"{}\"", path.replace('"', "\\\""))
     } else {
         path.to_string()
     }
@@ -31,7 +34,7 @@ fn quote_cmd(path: &str) -> String {
 fn backup(settings: &Path) -> std::io::Result<()> {
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
+        .map(|d| d.as_nanos())
         .unwrap_or(0);
     let name = settings
         .file_name()
@@ -46,9 +49,14 @@ fn backup(settings: &Path) -> std::io::Result<()> {
 fn write_atomic(path: &Path, v: &Value) -> std::io::Result<()> {
     let mut s = serde_json::to_string_pretty(v).unwrap_or_default();
     s.push('\n');
-    let tmp = path.with_extension("json.tmp");
+    // Per-process temp (sibling of the target → same filesystem, so the rename is atomic) so a
+    // concurrent run can't clobber it; clean up if the rename fails.
+    let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
     fs::write(&tmp, s)?;
-    fs::rename(&tmp, path)?;
+    if let Err(e) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
     Ok(())
 }
 
@@ -101,7 +109,8 @@ pub fn install(refresh: u64) -> i32 {
 
     if settings.exists() {
         if let Err(e) = backup(&settings) {
-            eprintln!("warning: could not back up settings: {e}");
+            eprintln!("error: could not back up settings, refusing to modify them: {e}");
+            return 1;
         }
     } else if let Some(parent) = settings.parent() {
         let _ = fs::create_dir_all(parent);
@@ -152,7 +161,8 @@ pub fn uninstall() -> i32 {
         }
     };
     if let Err(e) = backup(&settings) {
-        eprintln!("warning: could not back up settings: {e}");
+        eprintln!("error: could not back up settings, refusing to modify them: {e}");
+        return 1;
     }
     // shift_remove (not remove/swap_remove) so the other keys keep their order.
     let removed = root

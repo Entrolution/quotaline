@@ -83,6 +83,10 @@ fn run_statusline() {
         return;
     }
 
+    // Silent fallback: drop the default panic hook's stderr message. The catch_unwind below
+    // keeps the prompt alive; this just avoids leaking panic noise to the host.
+    std::panic::set_hook(Box::new(|_| {}));
+
     let mut raw = String::new();
     let _ = std::io::stdin().read_to_string(&mut raw);
     let input: serde_json::Value = if raw.trim().is_empty() {
