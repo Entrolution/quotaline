@@ -5,11 +5,7 @@ A Claude Code **status line** that shows your **official** account-wide usage li
 to hit a cap before it resets. It reads only the data Claude Code already hands it: no tokens,
 no API calls, no log scraping.
 
-```
-Opus 4.8 (1M context) · effort: max · ctx 46% (457k) · mem 61% (122ln)
-5h  ▕████████████                                    ▏ 25%  53m  ↑30%/h
-wk  ▕████▍                                           ▏  9%  6d3h  ↑2%/h  ⚠ cap 1d21h
-```
+![quotaline status line — a "model · effort · ctx · mem" header, then 5-hour and weekly usage bars (green/amber/red) with reset times, an inline burn rate, and a red cap warning](assets/demo.svg)
 
 Plus an on-demand report (`quotaline report`) with an approximate **$ headroom** estimate.
 
