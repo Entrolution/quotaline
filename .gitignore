@@ -10,5 +10,8 @@ __pycache__/
 # Claude Code workspace
 .claude/
 
+# Rust build output (Cargo.lock IS committed — this is a binary)
+/target/
+
 # OS cruft
 .DS_Store
