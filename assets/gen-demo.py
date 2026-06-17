@@ -48,17 +48,14 @@ def parse(line):
 
 def main():
     lines = [parse(l) for l in capture().split("\n")]
-    cw, lh, pad, top = 8.4, 22, 16, 34   # char width, line height, padding, titlebar height
+    cw, lh, pad = 8.4, 22, 16   # char width, line height, padding
     ncols = max(sum(len(t) for t, _ in segs) for segs in lines)
     W = round(ncols * cw + 2 * pad)
-    H = round(top + len(lines) * lh + pad)
+    H = round(2 * pad + len(lines) * lh)
     svg = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="14">',
-           f'<rect width="{W}" height="{H}" rx="8" fill="#0d1117"/>',
-           f'<rect width="{W}" height="{top}" rx="8" fill="#161b22"/><rect y="{top-8}" width="{W}" height="8" fill="#161b22"/>',
-           '<circle cx="18" cy="17" r="6" fill="#ff5f56"/><circle cx="38" cy="17" r="6" fill="#ffbd2e"/><circle cx="58" cy="17" r="6" fill="#27c93f"/>',
-           f'<text x="{W/2}" y="21" fill="#6e7681" font-size="12" text-anchor="middle">quotaline</text>']
+           f'<rect width="{W}" height="{H}" rx="8" fill="#0d1117"/>']
     for row, segs in enumerate(lines):
-        y = top + pad + row * lh
+        y = pad + 0.72 * lh + row * lh
         parts, col = [], 0
         for text, color in segs:
             x = pad + col * cw
