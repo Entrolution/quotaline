@@ -1,5 +1,11 @@
 # quotaline
 
+[![CI](https://github.com/Entrolution/quotaline/actions/workflows/ci.yml/badge.svg)](https://github.com/Entrolution/quotaline/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/Entrolution/quotaline?logo=github&color=2ea44f)](https://github.com/Entrolution/quotaline/releases/latest)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+![Platforms](https://img.shields.io/badge/platforms-macOS%20%C2%B7%20Linux%20%C2%B7%20Windows-555)
+![Rust](https://img.shields.io/badge/rust-stdlib%20%2B%20serde-dea584?logo=rust)
+
 A Claude Code **status line** that shows your **official** account-wide usage limits — the
 5-hour and weekly (7-day) windows — with a live burn rate and a warning when you're on track
 to hit a cap before it resets. It reads only the data Claude Code already hands it: no tokens,
