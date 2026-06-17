@@ -1,0 +1,14 @@
+# Per-machine runtime + usage history — never commit (it's your personal usage data)
+.state/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.ruff_cache/
+
+# Claude Code workspace
+.claude/
+
+# OS cruft
+.DS_Store
