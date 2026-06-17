@@ -1,0 +1,24 @@
+[package]
+name = "quotaline"
+version = "0.1.0"
+edition = "2021"
+description = "Zero-token Claude Code usage status line: official account-wide 5h & weekly limits, live burn rate, and cap warnings — read only from Claude Code's stdin."
+license = "MIT"
+repository = "https://github.com/Entrolution/quotaline"
+readme = "README.md"
+
+[[bin]]
+name = "quotaline"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+# preserve_order keeps the user's existing settings.json key order on install.
+serde_json = { version = "1", features = ["preserve_order"] }
+
+# Small, self-contained release binary for distribution.
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true

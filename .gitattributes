@@ -1,0 +1,3 @@
+# Normalize line endings to LF for all text files — keeps `rustfmt --check` stable on the
+# Windows CI runner and shell scripts valid regardless of git's autocrlf setting.
+* text=auto eol=lf
