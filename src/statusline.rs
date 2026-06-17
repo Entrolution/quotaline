@@ -82,6 +82,9 @@ fn header(input: &Value) -> Option<String> {
             ctx_color(abs_tok, Some(pct))
         ));
     }
+    if let Some(stat) = crate::memory::measure(str_at(input, &["transcript_path"])) {
+        parts.push(crate::memory::header_segment(&stat));
+    }
     if parts.is_empty() {
         None
     } else {

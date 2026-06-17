@@ -1,21 +1,35 @@
 //! quotaline — a Claude Code status line (and report) for account-wide usage limits.
 //!
-//!   quotaline                      read the stdin payload, render the status line
-//!   quotaline report [--window N]  on-demand burn-rate + headroom report
+//!   quotaline                          render the status line (reads JSON on stdin)
+//!   quotaline report [--window N]      on-demand burn-rate + headroom report
+//!   quotaline install [--refresh N]    wire into ~/.claude/settings.json
+//!   quotaline uninstall                remove it again
 //!
-//! Data comes only from the JSON Claude Code pipes to status-line scripts on stdin —
+//! Status-line data comes only from the JSON Claude Code pipes on stdin —
 //! no network, no auth, no Terms-of-Service surface.
 
-use std::io::{Read, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 mod bars;
 mod burn;
 mod fmt;
 mod history;
+mod install;
 mod json;
+mod memory;
 mod report;
 mod statusline;
+
+const USAGE: &str = "\
+quotaline — Claude Code usage status line
+
+USAGE:
+  quotaline                        render the status line (reads Claude Code's JSON on stdin)
+  quotaline report [--window N]    on-demand burn-rate + headroom report (N minutes)
+  quotaline install [--refresh N]  wire into ~/.claude/settings.json (refresh seconds; default 10)
+  quotaline uninstall              remove the statusLine block
+";
 
 /// Current Unix time in seconds (fractional). 0 if the clock is before the epoch.
 pub fn now_secs() -> f64 {
@@ -28,22 +42,47 @@ pub fn now_secs() -> f64 {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
+        None => run_statusline(),
         Some("report") => {
-            let window = parse_window(&args).unwrap_or(report::DEFAULT_WINDOW_MIN);
+            let window = flag_f64(&args, "--window").unwrap_or(report::DEFAULT_WINDOW_MIN);
             std::process::exit(report::run(window));
         }
-        _ => run_statusline(),
+        Some("install") => {
+            let refresh = flag_u64(&args, "--refresh").unwrap_or(10);
+            std::process::exit(install::install(refresh));
+        }
+        Some("uninstall") => std::process::exit(install::uninstall()),
+        Some("-h") | Some("--help") | Some("help") => print!("{USAGE}"),
+        Some(other) => {
+            eprintln!("quotaline: unknown command '{other}'\n");
+            eprint!("{USAGE}");
+            std::process::exit(2);
+        }
     }
 }
 
-fn parse_window(args: &[String]) -> Option<f64> {
-    let idx = args.iter().position(|a| a == "--window")?;
-    args.get(idx + 1)?.parse::<f64>().ok()
+fn flag_value<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
+    let idx = args.iter().position(|a| a == name)?;
+    args.get(idx + 1).map(String::as_str)
+}
+
+fn flag_f64(args: &[String], name: &str) -> Option<f64> {
+    flag_value(args, name)?.parse().ok()
+}
+
+fn flag_u64(args: &[String], name: &str) -> Option<u64> {
+    flag_value(args, name)?.parse().ok()
 }
 
 /// The status-line path: read stdin, render, print, then log a sample. Each stage is wrapped
 /// so a panic can never break the prompt (the analogue of the Python's top-level try/except).
 fn run_statusline() {
+    // Invoked interactively with no piped input? Show usage rather than blocking on stdin.
+    if std::io::stdin().is_terminal() {
+        print!("{USAGE}");
+        return;
+    }
+
     let mut raw = String::new();
     let _ = std::io::stdin().read_to_string(&mut raw);
     let input: serde_json::Value = if raw.trim().is_empty() {
