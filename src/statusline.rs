@@ -92,9 +92,17 @@ fn header(input: &Value) -> Option<String> {
     }
 }
 
+/// The dim reset readout: the time-to-reset duration, plus the absolute local clock it lands at
+/// (e.g. `6d3h @ 12am (Wed)`). The clock is dropped only if local time can't be resolved.
 fn reset_text(reset: Option<f64>, now: f64) -> String {
     match reset {
-        Some(e) => fmt_dur((e - now) as i64),
+        Some(e) => {
+            let dur = fmt_dur((e - now) as i64);
+            match crate::fmt::fmt_clock(e) {
+                Some(clock) => format!("{dur} @ {clock}"),
+                None => dur,
+            }
+        }
         None => "—".to_string(),
     }
 }
