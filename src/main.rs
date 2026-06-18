@@ -17,6 +17,7 @@ mod fmt;
 mod history;
 mod install;
 mod json;
+mod localtime;
 mod memory;
 mod report;
 mod statusline;

@@ -66,6 +66,35 @@ pub fn fmt_rate(r: f64) -> String {
     s.trim_end_matches('0').trim_end_matches('.').to_string()
 }
 
+/// Weekday abbreviations indexed by `tm_wday` (0 = Sunday), matching strftime's `%a`.
+const WDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+/// Format a local (hour 0–23, minute, weekday 0=Sunday) as `8:50pm (Wed)` — the original
+/// Python reset clock. Pure, so it is unit-testable without a timezone.
+pub fn fmt_clock_parts(hour24: i32, minute: i32, wday: i32) -> String {
+    let h12 = match hour24.rem_euclid(12) {
+        0 => 12,
+        h => h,
+    };
+    let ampm = if hour24.rem_euclid(24) < 12 {
+        "am"
+    } else {
+        "pm"
+    };
+    let wd = WDAYS
+        .get(wday.rem_euclid(7) as usize)
+        .copied()
+        .unwrap_or("?");
+    format!("{h12}:{minute:02}{ampm} ({wd})")
+}
+
+/// The local-time reset clock for a UTC `epoch` (e.g. `8:50pm (Wed)`), or `None` when local time
+/// is unavailable (unsupported platform or a value the C library rejects).
+pub fn fmt_clock(epoch: f64) -> Option<String> {
+    let (h, m, wday) = crate::localtime::local_hms(epoch as i64)?;
+    Some(fmt_clock_parts(h, m, wday))
+}
+
 /// Integer with thousands separators (`264,000`). Rust's std has no grouped format.
 pub fn group_thousands(n: f64) -> String {
     let neg = n < 0.0;
@@ -100,6 +129,15 @@ mod tests {
         assert_eq!(fmt_dur(2 * 3600 + 5 * 60), "2h05m");
         assert_eq!(fmt_dur(6 * 86_400 + 3 * 3600), "6d3h");
         assert_eq!(fmt_dur(2 * 86_400), "2d");
+    }
+
+    #[test]
+    fn clock_parts() {
+        assert_eq!(fmt_clock_parts(20, 50, 3), "8:50pm (Wed)");
+        assert_eq!(fmt_clock_parts(0, 5, 3), "12:05am (Wed)"); // midnight → 12am
+        assert_eq!(fmt_clock_parts(12, 0, 1), "12:00pm (Mon)"); // noon → 12pm
+        assert_eq!(fmt_clock_parts(13, 9, 0), "1:09pm (Sun)");
+        assert_eq!(fmt_clock_parts(23, 59, 6), "11:59pm (Sat)");
     }
 
     #[test]

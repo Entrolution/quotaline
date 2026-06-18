@@ -62,7 +62,13 @@ pub fn run(window_min: f64) -> i32 {
 
         if let Some(reset) = a.reset {
             let ttr = reset - now;
-            line.push_str(&format!("{DIM}   resets in {}{RESET}", fmt_dur(ttr as i64)));
+            let clock = crate::fmt::fmt_clock(reset)
+                .map(|c| format!(" @ {c}"))
+                .unwrap_or_default();
+            line.push_str(&format!(
+                "{DIM}   resets in {}{clock}{RESET}",
+                fmt_dur(ttr as i64)
+            ));
             if burning && cur < 100.0 {
                 let eta = (100.0 - cur) / a.rate.unwrap() * 3600.0;
                 if eta < ttr {

@@ -43,7 +43,8 @@ Plus an on-demand report (`quotaline report`) with an approximate **$ headroom**
 
 - a smooth sub-cell fill, green `< 80%` / amber `80–89%` / red `≥ 90%`, tracking the live
   value (so a reset drops it back to green);
-- the time until that window resets (`53m`, `6d3h`);
+- the time until that window resets, with the local clock time it lands at
+  (`53m @ 1:59pm (Thu)`, `6d3h @ 5:05pm (Wed)`);
 - `↑X%/h` — the **burn rate**, a least-squares fit over recent samples within the current
   reset segment (so a reset never reads as negative burn);
 - `⚠ cap <eta>` — shown **only** when, at the current rate, you'd hit 100% *before* the window
@@ -112,10 +113,10 @@ quotaline report --window 60   # use the last 60 minutes instead
 ```
 Claude usage — burn rate  (42 samples over 3h12m)
 
-  5h  ████░░░░░░░░░░   25%  +30.0%/hr   ETA 2h30m   resets in 53m  → resets first
+  5h  ████░░░░░░░░░░   25%  +30.0%/hr   ETA 2h30m   resets in 53m @ 1:59pm (Thu)  → resets first
       headroom ~$11.00   ($0.147/1%, ≈17,600 raw-tok/1%)
 
-  wk  █░░░░░░░░░░░░░    9%  +2.0%/hr   ETA 1d21h   resets in 6d3h  → hits cap first
+  wk  █░░░░░░░░░░░░░    9%  +2.0%/hr   ETA 1d21h   resets in 6d3h @ 5:05pm (Wed)  → hits cap first
       headroom ~$200.20   ($2.200/1%, ≈264,000 raw-tok/1%)
 ```
 
