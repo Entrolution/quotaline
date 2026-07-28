@@ -8,8 +8,9 @@
 
 A Claude Code **status line** that shows your **official** account-wide usage limits — the
 5-hour and weekly (7-day) windows — with a live burn rate and a warning when you're on track
-to hit a cap before it resets. It reads only the data Claude Code already hands it: no tokens,
-no API calls, no log scraping.
+to hit a cap before it resets. On **API-key (pay-as-you-go) billing**, where no limits exist,
+it shows your **real dollar spend** instead — this session, today across sessions, and $/hour.
+It reads only the data Claude Code already hands it: no tokens, no API calls, no log scraping.
 
 ![quotaline status line — a "model · effort · ctx · mem" header, then 5-hour and weekly usage bars (green/amber/red) with reset times, an inline burn rate, and a red cap warning](assets/demo.svg)
 
@@ -27,7 +28,7 @@ Plus an on-demand report (`quotaline report`) with an approximate **$ headroom**
   driving a hidden browser session — quotaline needs neither.)
 - **One line = your whole account.** The 5h/weekly limits are account-wide, shared across
   every session and surface, so a single status line already reflects your total.
-- **One small binary.** A single ~400 KB native executable — no runtime, no dependencies, and
+- **One small binary.** A single ~470 KB native executable — no runtime, no dependencies, and
   it installs itself.
 
 ## What it shows
@@ -53,6 +54,35 @@ Plus an on-demand report (`quotaline report`) with an approximate **$ headroom**
 Before your plan/session produces usage data, the line shows
 `limits n/a (awaiting first API response)`.
 
+### API-key (pay-as-you-go) mode
+
+With an organisational/API-key setup (`ANTHROPIC_API_KEY` or `apiKeyHelper`), Claude Code
+never sends `rate_limits` — there is no account allowance to show. quotaline detects this
+(a `cost` object, no `rate_limits`, real cost accrued) and switches to **dollars**:
+
+- the **session's cost** joins the header (`… · ctx 7% (67k) · $1.81 · mem …`);
+- a **`day` line** shows the machine's total spend **today** across all API-key sessions,
+  the **`↑$X/h` burn rate**, and the time until the counter rolls over at local midnight:
+
+  ```
+  day  $12.40  4h50m @ 12:00am (Tue)  ↑$3.2/h
+  ```
+
+- set **`QUOTALINE_DAILY_BUDGET`** (USD, a plain number: `50`, not `$50`) and the day line
+  becomes the familiar bar — % of budget with the green/amber/red bands, a `⚠ budget <eta>`
+  warning when the current rate would hit the budget before midnight, and `⚠ over budget`
+  once it's spent:
+
+  ```
+  day  ▕███████▌                      ▏ 25%  $12.40 of $50 · 4h50m @ 12:00am (Tue)  ↑$3.2/h
+  ```
+
+Unlike the subscription percentages (account-wide), the day figure covers **this machine's
+Claude Code sessions only** — but it's your actual pay-as-you-go usage as Claude Code costs
+it (list-price), not a guess against an unpublished cap. Subscription projects on the same
+machine keep their bars: the two modes are detected per session, and API-key spend never
+contaminates the subscription report's $-headroom anchor (nor vice versa).
+
 ### Memory gauge
 
 `mem N% (Xln)` tracks the current project's `MEMORY.md` — the index Claude Code auto-loads
@@ -64,8 +94,9 @@ when the project has a `MEMORY.md`.
 
 ## Install
 
-Requires a recent **Claude Code** (its status-line input must include `rate_limits`) and a
-**Pro or Max** plan.
+Requires a recent **Claude Code**: on a **Pro or Max** plan you get the limit bars (the
+status-line input must include `rate_limits`); on **API-key billing** you get the
+real-$ spend line instead.
 
 **macOS / Linux:**
 
@@ -126,6 +157,15 @@ tools) moves the percentage without showing up in the cost log. The 5h and weekl
 are computed separately, since the same spend moves the two windows by different amounts.
 Treat the dollar figure as a ballpark.
 
+When the history contains API-key spend from today, the report adds a **`day` section**
+with the dollars spent, the recent $/hr rate, and — if `QUOTALINE_DAILY_BUDGET` is set —
+whether you hit the budget or midnight first:
+
+```
+  day  $12.40 today (2 sessions)   +$3.2/hr   rolls over in 4h50m @ 12:00am (Tue)
+      budget $50/day — 25% used → rolls over first
+```
+
 ## Configuration
 
 `refreshInterval` (seconds, in the `statusLine` block) is how often the line re-renders even
@@ -137,6 +177,8 @@ Environment overrides:
 - `CTT_STATE_DIR` — where the history lives (default `~/.claude/quotaline`).
 - `CLAUDE_SETTINGS` — which settings file `install`/`uninstall` edit.
 - `QUOTALINE_BIN_DIR` — where the install script puts the binary.
+- `QUOTALINE_DAILY_BUDGET` — USD/day; turns the API-key `day` line into a %-of-budget bar
+  with a budget-ETA warning (no effect on subscription sessions).
 
 Colour thresholds, bar caps and the sampling/rate windows are compile-time constants at the
 top of the `src` modules — change them and rebuild from source.
@@ -145,7 +187,7 @@ top of the `src` modules — change them and rebuild from source.
 
 Claude Code runs the `statusLine` command on each render and pipes a JSON object to it on
 stdin. quotaline reads the fields it needs (`rate_limits`, `context_window`, `model`,
-`effort`, `cost`, `transcript_path`), renders the lines, and — *after* flushing output, so it
+`effort`, `cost`, `session_id`, `transcript_path`), renders the lines, and — *after* flushing output, so it
 can never delay your prompt — appends one usage sample to its history (throttled, pruned,
 written via a per-process temp file + atomic rename). Every stage is wrapped so a failure
 prints nothing rather than breaking your status line.
@@ -157,9 +199,21 @@ Prebuilt binaries for macOS (Apple Silicon + Intel), Linux (x86-64 + arm64) and 
 
 ## Notes & limits
 
-- `rate_limits` is emitted only for **Pro/Max** accounts, and only **after the session's
-  first API response**. Until then (or on a plan/version that doesn't send it) the line shows
-  `limits n/a`. Each window can be independently absent.
+- `rate_limits` is emitted only for **Pro/Max** accounts. On a version that doesn't send it
+  (and doesn't send `cost` either) the line shows `limits n/a`. Each window can be
+  independently absent.
+- API-key detection rests on `rate_limits` being absent (Claude Code provides no explicit
+  billing-type field). On a Claude Code **too old to send `rate_limits` at all**, a
+  subscription session is indistinguishable from an API-key one and shows the day line
+  with its *estimated* session cost instead of bars — upgrade Claude Code to get the
+  subscription view back.
+- The API-key **day** total is reconstructed from quotaline's own sample history (which
+  grows to ~25h of retention once API-key samples exist; subscription-only histories keep
+  the original small file), so it only sees sessions rendered on this machine since the
+  feature was installed — spend by other users of the same organisational key (or before
+  install) doesn't appear. Spend that can't be *proven* to belong to today — a session's
+  cost before its first logged sample, or a pre-existing session with no pre-midnight
+  sample — is under-counted rather than guessed.
 - Anthropic doesn't publish the absolute token caps, so this shows **% of your allowance
   consumed**, not raw counts — which is the gauge you actually want.
 - `~/.claude/quotaline/` holds per-machine history. Safe to delete; it just resets the

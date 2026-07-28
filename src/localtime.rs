@@ -9,10 +9,11 @@
 //!
 //! All release targets are 64-bit, where `time_t` is 64-bit, so the epoch is passed as `i64`.
 
-/// Local (hour 0–23, minute 0–59, weekday 0=Sunday) for a UTC `epoch`, or `None` if the C library
-/// rejects the value (out of range) or the platform has no `localtime` we know how to call.
+/// Local (hour 0–23, minute 0–59, second 0–60, weekday 0=Sunday) for a UTC `epoch`, or `None`
+/// if the C library rejects the value (out of range) or the platform has no `localtime` we know
+/// how to call.
 #[cfg(unix)]
-pub fn local_hms(epoch: i64) -> Option<(i32, i32, i32)> {
+pub fn local_hms(epoch: i64) -> Option<(i32, i32, i32, i32)> {
     use std::ffi::{c_char, c_int, c_long};
 
     // POSIX `struct tm`, including the BSD/glibc `tm_gmtoff`/`tm_zone` tail present on both macOS
@@ -44,12 +45,12 @@ pub fn local_hms(epoch: i64) -> Option<(i32, i32, i32)> {
         return None;
     }
     let tm = unsafe { tm.assume_init() };
-    Some((tm.tm_hour, tm.tm_min, tm.tm_wday))
+    Some((tm.tm_hour, tm.tm_min, tm.tm_sec, tm.tm_wday))
 }
 
 /// Windows uses the UCRT's `_localtime64_s`; its `struct tm` has no `tm_gmtoff`/`tm_zone` tail.
 #[cfg(windows)]
-pub fn local_hms(epoch: i64) -> Option<(i32, i32, i32)> {
+pub fn local_hms(epoch: i64) -> Option<(i32, i32, i32, i32)> {
     use std::ffi::c_int;
 
     #[repr(C)]
@@ -77,10 +78,63 @@ pub fn local_hms(epoch: i64) -> Option<(i32, i32, i32)> {
         return None;
     }
     let tm = unsafe { tm.assume_init() };
-    Some((tm.tm_hour, tm.tm_min, tm.tm_wday))
+    Some((tm.tm_hour, tm.tm_min, tm.tm_sec, tm.tm_wday))
 }
 
 #[cfg(not(any(unix, windows)))]
-pub fn local_hms(_epoch: i64) -> Option<(i32, i32, i32)> {
+pub fn local_hms(_epoch: i64) -> Option<(i32, i32, i32, i32)> {
     None
+}
+
+/// Snap a candidate epoch to the local midnight nearest to it. Plain second-of-day
+/// arithmetic misses local midnight by the shift amount whenever a DST transition falls
+/// between the two instants, so the candidate is re-inspected and the residual removed.
+/// In zones whose spring-forward lands exactly on midnight (Havana, Santiago, Cairo …)
+/// 00:00 doesn't exist that day — subtracting the residual would land an hour into the
+/// previous day (and can put the rollover in the past), so the subtraction is verified and
+/// the candidate kept when no true midnight exists: the candidate is already the first
+/// instant of that local day.
+fn snap_to_local_midnight(candidate: i64) -> Option<i64> {
+    let (h, m, s, _) = local_hms(candidate)?;
+    let off = (h as i64) * 3600 + (m as i64) * 60 + (s as i64);
+    if off == 0 {
+        return Some(candidate);
+    }
+    if off > 43_200 {
+        // Landed late in the previous local day; the day's first instant lies ahead (and
+        // equals it even when a midnight transition means that instant reads as 01:00).
+        return Some(candidate + (86_400 - off));
+    }
+    let snapped = candidate - off;
+    match local_hms(snapped) {
+        Some((0, 0, 0, _)) => Some(snapped),
+        _ => Some(candidate), // midnight doesn't exist (DST gap at 00:00)
+    }
+}
+
+/// Epoch of today's local midnight — the start of the "spent today" window.
+pub fn local_midnight(now: f64) -> Option<f64> {
+    let (h, m, s, _) = local_hms(now as i64)?;
+    let sec_of_day = (h as i64) * 3600 + (m as i64) * 60 + (s as i64);
+    snap_to_local_midnight(now as i64 - sec_of_day).map(|t| t as f64)
+}
+
+/// Epoch of the next local midnight after `now` — the "spent today" rollover. Derived with
+/// its own snap rather than `local_midnight + 86_400`, since a DST transition later today
+/// shifts the rollover but not the start.
+pub fn next_local_midnight(now: f64) -> Option<f64> {
+    let (h, m, s, _) = local_hms(now as i64)?;
+    let sec_of_day = (h as i64) * 3600 + (m as i64) * 60 + (s as i64);
+    snap_to_local_midnight(now as i64 - sec_of_day + 86_400).map(|t| t as f64)
+}
+
+/// The day window bounds `(start, rollover)`, falling back to UTC midnights when local
+/// time is unavailable — a stable rollover beats none. The fallback is wholesale so the
+/// pair can never mix a local start with a UTC rollover.
+pub fn day_bounds(now: f64) -> (f64, f64) {
+    if let (Some(start), Some(roll)) = (local_midnight(now), next_local_midnight(now)) {
+        return (start, roll);
+    }
+    let utc_start = (now / 86_400.0).floor() * 86_400.0;
+    (utc_start, utc_start + 86_400.0)
 }
