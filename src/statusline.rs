@@ -1,19 +1,22 @@
-//! Assembles the three-line status line (header + 5h/weekly bars) from the stdin payload.
+//! Assembles the status line from the stdin payload: header plus 5h/weekly bars on a
+//! subscription, or header plus a real-$ "spent today" line on API-key billing.
 
 use serde_json::Value;
 
 use crate::bars::framed;
 use crate::burn::{burn_suffix, history_rate, Win};
-use crate::fmt::{color_for, fmt_dur, fmt_tokens, AMBER, DIM, GRAY, GREEN, RED, RESET};
-use crate::history::{read_history, state_dir};
-use crate::json::{f64_at, get_pct, get_reset, nested, str_at};
+use crate::fmt::{color_for, fmt_dur, fmt_tokens, fmt_usd, AMBER, DIM, GRAY, GREEN, RED, RESET};
+use crate::history::{read_history, state_dir, RATE_WINDOW_MIN};
+use crate::json::{f64_at, get_pct, get_reset, nested, payload_mode, str_at, Mode};
+use crate::spend::{day_rate, day_spend, spend_suffix, Live};
 
 const MIN_BAR: usize = 8;
 const MAX_BAR: usize = 150;
 const SAFE_MARGIN: usize = 8;
 const FALLBACK_COLS: usize = 80;
-// per-line fixed overhead: label(2) + 2sp + frame(1) + frame(1) + sp(1) + pct(3) + 2sp
-const LINE_OVERHEAD: usize = 12;
+// per-line fixed overhead around the bar, excluding the label: 2sp + frame(1) + frame(1) +
+// sp(1) + pct(3) + 2sp
+const LINE_OVERHEAD: usize = 10;
 
 const CTX_AMBER_TOK: f64 = 200_000.0;
 const CTX_RED_TOK: f64 = 500_000.0;
@@ -56,7 +59,8 @@ fn ctx_color(abs_tok: Option<f64>, pct: Option<f64>) -> &'static str {
 }
 
 /// Compact `Model · effort: level · ctx N% (size)` header; `None` if all absent.
-fn header(input: &Value) -> Option<String> {
+/// `session_usd` (API-key mode only) appends the session's real billed cost.
+fn header(input: &Value, session_usd: Option<f64>) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
     if let Some(model) = str_at(input, &["model", "display_name"]) {
         parts.push(format!("{DIM}{model}{RESET}"));
@@ -81,6 +85,9 @@ fn header(input: &Value) -> Option<String> {
             "{DIM}ctx {RESET}{}{val}{RESET}",
             ctx_color(abs_tok, Some(pct))
         ));
+    }
+    if let Some(u) = session_usd {
+        parts.push(fmt_usd(u));
     }
     if let Some(stat) = crate::memory::measure(str_at(input, &["transcript_path"])) {
         parts.push(crate::memory::header_segment(&stat));
@@ -139,14 +146,27 @@ fn join_right(rt: &str, suffix_plain: &str) -> String {
     }
 }
 
-/// Render the full status line (no trailing newline). Pure — logging happens after, in main.
+/// Render the full status line (no trailing newline). Pure aside from reading the sample
+/// history and env — logging happens after, in main.
 pub fn render(input: &Value, now: f64) -> String {
-    let rl = nested(input, &["rate_limits"]);
-    let present = matches!(rl, Some(Value::Object(m)) if !m.is_empty());
-    if !present {
-        return format!("{GRAY}limits n/a (awaiting first API response){RESET}");
+    match payload_mode(input) {
+        Mode::Subscription => render_subscription(input, now),
+        Mode::ApiKey => render_api_key(input, now),
+        Mode::Unknown => limits_na(),
     }
-    let rl = rl.unwrap();
+}
+
+fn limits_na() -> String {
+    format!("{GRAY}limits n/a (awaiting first API response){RESET}")
+}
+
+/// Subscription (Pro/Max): the account-wide 5-hour and weekly bars.
+fn render_subscription(input: &Value, now: f64) -> String {
+    // payload_mode guarantees a non-empty rate_limits object here, but that invariant lives
+    // in another module — degrade like every other missing-data path rather than trusting it.
+    let Some(rl) = nested(input, &["rate_limits"]) else {
+        return limits_na();
+    };
     let five = rl.get("five_hour").filter(|v| !v.is_null());
     let week = rl.get("seven_day").filter(|v| !v.is_null());
 
@@ -177,15 +197,80 @@ pub fn render(input: &Value, now: f64) -> String {
         .count()
         .max(join_right(&rt7, &week_sp).chars().count());
 
-    let width = term_width();
-    let avail = width as i64 - SAFE_MARGIN as i64 - LINE_OVERHEAD as i64 - max_right as i64;
-    let bar_width = avail.clamp(MIN_BAR as i64, MAX_BAR as i64) as usize;
+    let bar_width = bar_width(2, max_right);
 
     let mut lines: Vec<String> = Vec::new();
-    if let Some(h) = header(input) {
+    if let Some(h) = header(input, None) {
         lines.push(h);
     }
     lines.push(render_line("5h", five_pct, bar_width, &rt5, &five_sc));
     lines.push(render_line("wk", week_pct, bar_width, &rt7, &week_sc));
+    lines.join("\n")
+}
+
+/// Bar cells available given the label width and the longest right-hand text.
+fn bar_width(label_len: usize, max_right: usize) -> usize {
+    let width = term_width();
+    let avail =
+        width as i64 - SAFE_MARGIN as i64 - (LINE_OVERHEAD + label_len) as i64 - max_right as i64;
+    avail.clamp(MIN_BAR as i64, MAX_BAR as i64) as usize
+}
+
+/// API-key (pay-as-you-go): no account allowance exists, so show real dollars instead —
+/// the session's cost in the header and a machine-wide "spent today" line beneath, with a
+/// $/h burn rate and the local-midnight rollover (plus a budget bar when one is set).
+fn render_api_key(input: &Value, now: f64) -> String {
+    // Filter once at the source: everything below (header, live point) inherits it.
+    let usd = f64_at(input, &["cost", "total_cost_usd"]).filter(|u| u.is_finite() && *u >= 0.0);
+    let hist = read_history(&state_dir());
+    let sid = str_at(input, &["session_id"]);
+    // A resumed subscription session restores its cost before rate_limits repopulates and
+    // so classifies as ApiKey for a moment; if the history knows this sid as subscription,
+    // keep the honest waiting line rather than presenting shadow cost as spend.
+    if let Some(k) = crate::history::session_key(sid) {
+        if crate::history::subscription_sids(&hist).contains(&k) {
+            return limits_na();
+        }
+    }
+    let (midnight, next_mid) = crate::localtime::day_bounds(now);
+
+    let live = usd.map(|u| Live { sid, usd: u });
+    let day = day_spend(&hist, midnight, live.as_ref());
+    // No attributable session (e.g. a payload without a session id): day accounting is
+    // impossible, so fall back like the report does rather than rendering an empty $0 line.
+    if day.sessions == 0 {
+        return limits_na();
+    }
+    let rate = day_rate(&hist, live.as_ref(), RATE_WINDOW_MIN * 60.0, now);
+
+    let budget = crate::spend::daily_budget();
+    let (sp, sc) = spend_suffix(day.total, budget, rate, next_mid, now);
+    let rt_reset = reset_text(Some(next_mid), now);
+
+    let mut lines: Vec<String> = Vec::new();
+    if let Some(h) = header(input, usd) {
+        lines.push(h);
+    }
+    lines.push(match budget {
+        Some(b) => {
+            // Display-clamp the percentage: spend isn't capped at the budget, and an
+            // unbounded value would blow the 3-char field the width maths reserves.
+            let pct = (day.total / b * 100.0).min(999.0);
+            let rt = format!("{} of {} · {}", fmt_usd(day.total), fmt_usd(b), rt_reset);
+            let bw = bar_width(3, join_right(&rt, &sp).chars().count());
+            render_line("day", Some(pct), bw, &rt, &sc)
+        }
+        None => {
+            let mut s = format!(
+                "{DIM}day{RESET}  {}  {DIM}{rt_reset}{RESET}",
+                fmt_usd(day.total)
+            );
+            if !sc.is_empty() {
+                s.push_str("  ");
+                s.push_str(&sc);
+            }
+            s
+        }
+    });
     lines.join("\n")
 }

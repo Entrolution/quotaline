@@ -30,7 +30,8 @@ impl Win {
     }
 }
 
-/// Least-squares slope of pct vs. time, returned in %/hour.
+/// Least-squares slope of value vs. time, returned in units/hour (percent for the window
+/// bars, dollars for the day line).
 pub fn slope_per_hr(points: &[(f64, f64)]) -> Option<f64> {
     let n = points.len();
     if n < 2 {
@@ -152,9 +153,22 @@ fn sum_session_delta<F: Fn(&Sample) -> Option<f64>>(
 
 /// Per-window analysis for the report: current %, recent rate, and the cost/token anchors.
 pub fn analyze(hist: &[Sample], win: Win, window_sec: f64, now: f64) -> Option<Analysis> {
-    let latest = hist.last()?;
+    // The most recent non-API sample — flagged API samples sharing the history carry no
+    // window percentages, so skipping only those preserves the old `hist.last()` behaviour
+    // for pure-subscription histories: a trailing sub sample without this window (however
+    // degenerate its shape) is still picked, yields no pct, and omits the section as before.
+    let latest = hist
+        .iter()
+        .rev()
+        .find(|s| !crate::history::is_api_sample(s))?;
     let cur = win.pct(latest)?;
     let cur_reset = win.reset(latest);
+    // With retention now spanning ~a day, that sample can be old (e.g. a Max plan switched
+    // to an API key this morning): a window whose reset has already passed is stale, and
+    // presenting it as current ("resets in now") would be wrong. Omit it instead.
+    if cur_reset.is_some_and(|r| r <= now) {
+        return None;
+    }
 
     let seg = segment(hist, win, cur_reset);
     let rate = slope_over(&seg, win, window_sec, now);
@@ -171,7 +185,14 @@ pub fn analyze(hist: &[Sample], win: Win, window_sec: f64, now: f64) -> Option<A
                 .iter()
                 .filter(|e| {
                     let t = e.t as f64;
-                    t >= t0 && t <= t1
+                    // API-key dollars are real spend but don't move subscription %, so they
+                    // must not inflate the $/1% anchor. `lacks_window_data` also drops
+                    // samples whose flag an old binary stripped — excluding a maybe-API
+                    // sample from subscription maths is the safe direction.
+                    !crate::history::is_api_sample(e)
+                        && !crate::history::lacks_window_data(e)
+                        && t >= t0
+                        && t <= t1
                 })
                 .collect();
             let usd = sum_session_delta(&window_entries, |s| s.usd);
@@ -239,6 +260,51 @@ mod tests {
         let r = history_rate(&hist, Win::FiveHour, Some(5000.0), 2000.0).unwrap();
         // 0→30 over 900s = 120%/h; the 90→95 prior-segment points are excluded.
         assert!((r - 120.0).abs() < 1e-6, "got {r}");
+    }
+
+    #[test]
+    fn analyze_skips_trailing_api_samples_and_their_cost() {
+        let mut hist = vec![
+            Sample {
+                t: 1000,
+                h5: Some(10.0),
+                h5r: Some(9000.0),
+                sid: Some("sub".into()),
+                usd: Some(1.0),
+                ..Default::default()
+            },
+            Sample {
+                t: 1600,
+                h5: Some(20.0),
+                h5r: Some(9000.0),
+                sid: Some("sub".into()),
+                usd: Some(2.0),
+                ..Default::default()
+            },
+        ];
+        // An API-key sample lands last (no window %, real dollars inside the anchor span).
+        hist.insert(
+            1,
+            Sample {
+                t: 1300,
+                sid: Some("api".into()),
+                usd: Some(50.0),
+                api: true,
+                ..Default::default()
+            },
+        );
+        hist.push(Sample {
+            t: 2000,
+            sid: Some("api".into()),
+            usd: Some(60.0),
+            api: true,
+            ..Default::default()
+        });
+        let a = analyze(&hist, Win::FiveHour, 7200.0, 2100.0).expect("window data exists");
+        assert_eq!(a.cur, 20.0); // from the last *subscription* sample, not skipped entirely
+        let usd_per_pct = a.conv.unwrap().usd_per_pct.unwrap();
+        // 10% moved for $1 of subscription cost; the API session's $10 delta is excluded.
+        assert!((usd_per_pct - 0.1).abs() < 1e-9, "got {usd_per_pct}");
     }
 
     #[test]

@@ -60,6 +60,43 @@ pub fn fmt_tokens(n: f64) -> String {
     }
 }
 
+/// Dollar amount → `$0.42`, `$12.40`, `$50` (whole dollars drop the `.00`), `$1235`
+/// (cents dropped once ≥ $1000). Non-finite input (belt-and-braces; callers filter) → `$—`.
+pub fn fmt_usd(v: f64) -> String {
+    if !v.is_finite() {
+        return "$—".to_string();
+    }
+    if v.abs() < 0.005 {
+        return "$0".to_string(); // incl. -0.0 and sub-cent noise, which "{:.2}" turns into "$-0"
+    }
+    if v >= 1000.0 {
+        format!("${v:.0}")
+    } else {
+        let s = format!("{v:.2}");
+        let s = s.strip_suffix(".00").unwrap_or(&s);
+        format!("${s}")
+    }
+}
+
+/// Dollar rate → `$0.35`, `$3.2`, `$12` (finer at small rates). Trailing zeros are trimmed
+/// only behind a decimal point — the ≥$10 branch emits none, and trimming an integer's
+/// zeros would turn $20 into $2.
+pub fn fmt_usd_rate(r: f64) -> String {
+    if !r.is_finite() {
+        return "$—".to_string();
+    }
+    if r >= 10.0 {
+        return format!("${r:.0}");
+    }
+    let s = if r >= 1.0 {
+        format!("{r:.1}")
+    } else {
+        format!("{r:.2}")
+    };
+    let t = s.trim_end_matches('0').trim_end_matches('.');
+    format!("${t}")
+}
+
 /// Burn rate → `30`, `4.3`, `2` (one decimal, trailing zeros trimmed).
 pub fn fmt_rate(r: f64) -> String {
     let s = format!("{r:.1}");
@@ -91,7 +128,7 @@ pub fn fmt_clock_parts(hour24: i32, minute: i32, wday: i32) -> String {
 /// The local-time reset clock for a UTC `epoch` (e.g. `8:50pm (Wed)`), or `None` when local time
 /// is unavailable (unsupported platform or a value the C library rejects).
 pub fn fmt_clock(epoch: f64) -> Option<String> {
-    let (h, m, wday) = crate::localtime::local_hms(epoch as i64)?;
+    let (h, m, _, wday) = crate::localtime::local_hms(epoch as i64)?;
     Some(fmt_clock_parts(h, m, wday))
 }
 
@@ -146,6 +183,35 @@ mod tests {
         assert_eq!(fmt_rate(4.3), "4.3");
         assert_eq!(fmt_rate(2.0), "2");
         assert_eq!(fmt_rate(0.0), "0");
+    }
+
+    #[test]
+    fn usd() {
+        assert_eq!(fmt_usd(0.42), "$0.42");
+        assert_eq!(fmt_usd(12.4), "$12.40");
+        assert_eq!(fmt_usd(50.0), "$50");
+        assert_eq!(fmt_usd(1234.56), "$1235");
+        assert_eq!(fmt_usd(0.0), "$0");
+        assert_eq!(fmt_usd(-0.0), "$0");
+        assert_eq!(fmt_usd(-0.004), "$0");
+        assert_eq!(fmt_usd(f64::NAN), "$—");
+        assert_eq!(fmt_usd(f64::INFINITY), "$—");
+    }
+
+    #[test]
+    fn usd_rates() {
+        assert_eq!(fmt_usd_rate(0.35), "$0.35");
+        assert_eq!(fmt_usd_rate(0.30), "$0.3");
+        assert_eq!(fmt_usd_rate(3.2), "$3.2");
+        assert_eq!(fmt_usd_rate(12.0), "$12");
+        assert_eq!(fmt_usd_rate(0.0), "$0");
+        // Integer-formatted rates must keep their significant zeros ($20/h is not $2/h).
+        assert_eq!(fmt_usd_rate(10.0), "$10");
+        assert_eq!(fmt_usd_rate(20.0), "$20");
+        assert_eq!(fmt_usd_rate(100.0), "$100");
+        assert_eq!(fmt_usd_rate(250.0), "$250");
+        assert_eq!(fmt_usd_rate(1000.0), "$1000");
+        assert_eq!(fmt_usd_rate(f64::NAN), "$—");
     }
 
     #[test]

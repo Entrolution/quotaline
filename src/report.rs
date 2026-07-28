@@ -1,9 +1,12 @@
 //! `quotaline report [--window N]` — the on-demand burn-rate + headroom report
-//! (a port of the original burn.py).
+//! (a port of the original burn.py), plus a real-$ day section for API-key sessions.
 
 use crate::burn::{analyze, Win};
-use crate::fmt::{color_for, fmt_dur, group_thousands, BOLD, DIM, GRAY, GREEN, RED, RESET};
+use crate::fmt::{
+    color_for, fmt_dur, fmt_usd, fmt_usd_rate, group_thousands, BOLD, DIM, GRAY, GREEN, RED, RESET,
+};
 use crate::history::{read_history, state_dir};
+use crate::spend::{budget_outcome, day_rate, day_spend, BudgetOutcome};
 
 pub const DEFAULT_WINDOW_MIN: f64 = 120.0;
 
@@ -37,11 +40,13 @@ pub fn run(window_min: f64) -> i32 {
     );
     println!();
 
+    let mut sub_shown = false;
     for (label, win) in [("5h", Win::FiveHour), ("wk", Win::SevenDay)] {
         let a = match analyze(&hist, win, window_min * 60.0, now) {
             Some(a) => a,
             None => continue,
         };
+        sub_shown = true;
         let cur = a.cur;
         let mut line = format!(
             "  {BOLD}{label}{RESET}  {}  {}{cur:>3.0}%{RESET}",
@@ -99,12 +104,104 @@ pub fn run(window_min: f64) -> i32 {
         println!();
     }
 
-    println!("{DIM}  % and ETA are exact (account-wide). $/token are estimates — they assume your{RESET}");
-    println!(
-        "{DIM}  usage is mostly these sessions; claude.ai etc. moves % but isn't logged.{RESET}"
-    );
-    println!(
-        "{DIM}  raw-tok counts include cache re-reads, so the $ figure is the steadier one.{RESET}"
-    );
+    let api_shown = api_section(&hist, window_min, now);
+
+    if sub_shown {
+        println!("{DIM}  % and ETA are exact (account-wide). $/token are estimates — they assume your{RESET}");
+        println!(
+            "{DIM}  usage is mostly these sessions; claude.ai etc. moves % but isn't logged.{RESET}"
+        );
+        println!(
+            "{DIM}  raw-tok counts include cache re-reads, so the $ figure is the steadier one.{RESET}"
+        );
+    }
+    if api_shown {
+        println!(
+            "{DIM}  day $ covers this machine's Claude Code API-key sessions only, from logged{RESET}"
+        );
+        println!(
+            "{DIM}  samples — the status line's live figure can run up to a minute ahead.{RESET}"
+        );
+    }
+    if !sub_shown && !api_shown {
+        println!(
+            "{DIM}  The samples carry no usable window percentages or API-key spend yet —{RESET}"
+        );
+        println!("{DIM}  nothing to analyse. Leave a session running and check back.{RESET}");
+    }
     0
+}
+
+/// The API-key day section: $ spent today across sessions, the recent $/hr rate, and —
+/// when `QUOTALINE_DAILY_BUDGET` is set — how spend stands against the budget. Printed only
+/// when API-key spend was attributed to today; returns whether it printed.
+fn api_section(hist: &[crate::history::Sample], window_min: f64, now: f64) -> bool {
+    let (midnight, next_mid) = crate::localtime::day_bounds(now);
+    let day = day_spend(hist, midnight, None);
+    if day.sessions == 0 {
+        return false;
+    }
+    let rate = day_rate(hist, None, window_min * 60.0, now);
+
+    let sessions = if day.sessions == 1 {
+        "1 session".to_string()
+    } else {
+        format!("{} sessions", day.sessions)
+    };
+    let mut line = format!(
+        "  {BOLD}day{RESET}  {BOLD}{}{RESET} today {DIM}({sessions}){RESET}",
+        fmt_usd(day.total)
+    );
+    match rate {
+        Some(r) if r.per_hr > crate::spend::IDLE_RATE_PER_HR => {
+            line.push_str(&format!("   +{}/hr", fmt_usd_rate(r.per_hr)))
+        }
+        _ => line.push_str(&format!("   {DIM}~idle (no measurable burn){RESET}")),
+    }
+    let clock = crate::fmt::fmt_clock(next_mid)
+        .map(|c| format!(" @ {c}"))
+        .unwrap_or_default();
+    line.push_str(&format!(
+        "{DIM}   rolls over in {}{clock}{RESET}",
+        fmt_dur((next_mid - now) as i64)
+    ));
+    println!("{line}");
+
+    match crate::spend::daily_budget() {
+        Some(b) => {
+            let pct = day.total / b * 100.0;
+            let mut extra = format!(
+                "      {DIM}budget {}/day — {}{:.0}%{RESET}{DIM} used{RESET}",
+                fmt_usd(b),
+                color_for(Some(pct)),
+                pct
+            );
+            match budget_outcome(day.total, b, rate, next_mid, now) {
+                BudgetOutcome::Over => {
+                    extra.push_str(&format!(" {RED}— over budget{RESET}"));
+                }
+                BudgetOutcome::HitsBudget { eta_secs } => {
+                    extra.push_str(&format!(
+                        "{DIM}, ETA {}{RESET} {RED}→ hits budget before midnight{RESET}",
+                        fmt_dur(eta_secs as i64)
+                    ));
+                }
+                BudgetOutcome::RollsOverFirst => {
+                    extra.push_str(&format!(" {GREEN}→ rolls over first{RESET}"));
+                }
+            }
+            println!("{extra}");
+        }
+        // The status line has no error channel, but the report does: say when a set
+        // budget was rejected (e.g. `$50` instead of `50`) instead of silently hiding it.
+        None if crate::spend::budget_var_set() => {
+            println!(
+                "      {DIM}QUOTALINE_DAILY_BUDGET is set but not a positive number \
+                 (use e.g. 50, not $50) — ignored.{RESET}"
+            );
+        }
+        None => {}
+    }
+    println!();
+    true
 }

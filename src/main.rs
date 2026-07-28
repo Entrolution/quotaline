@@ -1,4 +1,5 @@
-//! quotaline — a Claude Code status line (and report) for account-wide usage limits.
+//! quotaline — a Claude Code status line (and report) for account-wide usage limits, or —
+//! on API-key (pay-as-you-go) billing, which has no limits — real dollar spend.
 //!
 //!   quotaline                          render the status line (reads JSON on stdin)
 //!   quotaline report [--window N]      on-demand burn-rate + headroom report
@@ -20,6 +21,7 @@ mod json;
 mod localtime;
 mod memory;
 mod report;
+mod spend;
 mod statusline;
 
 const USAGE: &str = "\
@@ -45,7 +47,11 @@ fn main() {
     match args.get(1).map(String::as_str) {
         None => run_statusline(),
         Some("report") => {
-            let window = flag_f64(&args, "--window").unwrap_or(report::DEFAULT_WINDOW_MIN);
+            // A non-finite or non-positive window would silently distort every rate fit;
+            // fall back to the default rather than presenting garbage as an answer.
+            let window = flag_f64(&args, "--window")
+                .filter(|w| w.is_finite() && *w > 0.0)
+                .unwrap_or(report::DEFAULT_WINDOW_MIN);
             std::process::exit(report::run(window));
         }
         Some("install") => {
