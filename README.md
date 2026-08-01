@@ -134,6 +134,8 @@ To remove it (also backs up first):
 quotaline uninstall
 ```
 
+Release notes for each version are in [CHANGELOG.md](CHANGELOG.md).
+
 ## `quotaline report` — burn-rate & headroom
 
 The status line appends a usage sample to `~/.claude/quotaline/usage-history.json` on each
