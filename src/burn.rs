@@ -153,14 +153,18 @@ fn sum_session_delta<F: Fn(&Sample) -> Option<f64>>(
 
 /// Per-window analysis for the report: current %, recent rate, and the cost/token anchors.
 pub fn analyze(hist: &[Sample], win: Win, window_sec: f64, now: f64) -> Option<Analysis> {
-    // The most recent non-API sample — flagged API samples sharing the history carry no
-    // window percentages, so skipping only those preserves the old `hist.last()` behaviour
-    // for pure-subscription histories: a trailing sub sample without this window (however
-    // degenerate its shape) is still picked, yields no pct, and omits the section as before.
+    // The most recent sample that reported *some* subscription window. Everything sharing
+    // the history without window data — flagged API samples, and the window-less probes a
+    // session logs while a switch away from a subscription is unproven — says nothing about
+    // an allowance, and one of them landing last must not blank a live subscription
+    // session's section on a mixed-auth machine. A sample carrying one window but not this
+    // one is still picked (however degenerate its shape), yields no pct, and omits the
+    // section as before; a genuinely old percentage is caught by the stale-reset check
+    // below rather than by whatever happened to be logged last.
     let latest = hist
         .iter()
         .rev()
-        .find(|s| !crate::history::is_api_sample(s))?;
+        .find(|s| crate::history::has_window_data(s) && !crate::history::is_api_sample(s))?;
     let cur = win.pct(latest)?;
     let cur_reset = win.reset(latest);
     // With retention now spanning ~a day, that sample can be old (e.g. a Max plan switched
@@ -305,6 +309,25 @@ mod tests {
         let usd_per_pct = a.conv.unwrap().usd_per_pct.unwrap();
         // 10% moved for $1 of subscription cost; the API session's $10 delta is excluded.
         assert!((usd_per_pct - 0.1).abs() < 1e-9, "got {usd_per_pct}");
+    }
+
+    #[test]
+    fn a_switching_sessions_probes_dont_blank_a_live_subscription() {
+        // Mixed auth on one machine: a session mid-switch logs window-less probes (not yet
+        // flagged as spend) while another session is genuinely still on the subscription.
+        // Whichever happens to be logged last, the live session's window must still read.
+        let hist = vec![
+            sample(1000, 10.0, 9000.0),
+            sample(1600, 20.0, 9000.0),
+            Sample {
+                t: 1900,
+                sid: Some("switching".into()),
+                usd: Some(28.19),
+                ..Default::default()
+            },
+        ];
+        let a = analyze(&hist, Win::FiveHour, 7200.0, 2000.0).expect("window data exists");
+        assert_eq!(a.cur, 20.0);
     }
 
     #[test]
