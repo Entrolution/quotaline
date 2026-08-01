@@ -52,7 +52,10 @@ Plus an on-demand report (`quotaline report`) with an approximate **$ headroom**
   resets. No warning means you'll reset before you run out.
 
 Before your plan/session produces usage data, the line shows
-`limits n/a (awaiting first API response)`.
+`limits n/a (awaiting first API response)`. When the windows *stop* arriving for a session
+that had been reporting them — a resumed session waiting on its first fresh response, or one
+whose billing has changed — it reads `limits n/a (none reported for 12m)` instead, keeping
+the header.
 
 ### API-key (pay-as-you-go) mode
 
@@ -207,6 +210,18 @@ Prebuilt binaries for macOS (Apple Silicon + Intel), Linux (x86-64 + arm64) and 
   subscription session is indistinguishable from an API-key one and shows the day line
   with its *estimated* session cost instead of bars — upgrade Claude Code to get the
   subscription view back.
+- A session's billing can change **mid-life**: `--resume` reuses the session id, so a session
+  started on a subscription can be resumed from a shell that exports `ANTHROPIC_API_KEY` and
+  bill to the key from then on. quotaline keeps showing the waiting line until it has watched
+  that session's cost climb for 45 minutes with no `rate_limits` arriving. The resume
+  transient (cost restored, windows not yet repopulated) leaves the counter *frozen*, so it
+  can never be mistaken for a switch however long the session idles, and the clock starts at
+  the first climb rather than the first quiet sample. Spend during that wait isn't counted
+  towards the day total, the same undercount-rather-than-guess bias as below.
+- A single session's cost counter carries on through a change of billing, so a session that
+  ran on an API key, moved to a subscription and came back is only ever charged for the
+  movement *within* each API-key stretch — the climb across the subscription stretch is that
+  plan's shadow estimate, and is discarded rather than guessed at.
 - The API-key **day** total is reconstructed from quotaline's own sample history (which
   grows to ~25h of retention once API-key samples exist; subscription-only histories keep
   the original small file), so it only sees sessions rendered on this machine since the

@@ -137,7 +137,7 @@ pub fn run(window_min: f64) -> i32 {
 /// when API-key spend was attributed to today; returns whether it printed.
 fn api_section(hist: &[crate::history::Sample], window_min: f64, now: f64) -> bool {
     let (midnight, next_mid) = crate::localtime::day_bounds(now);
-    let day = day_spend(hist, midnight, None);
+    let day = day_spend(hist, midnight, None, now);
     if day.sessions == 0 {
         return false;
     }
