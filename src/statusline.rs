@@ -89,8 +89,15 @@ fn header(input: &Value, session_usd: Option<f64>) -> Option<String> {
     if let Some(u) = session_usd {
         parts.push(fmt_usd(u));
     }
+    // `mem` then `int`, matching the direction of flow: Claude writes to MEMORY.md as an
+    // inbox and `/dream` drains it into the curated intuition.md. On a migrated store a large
+    // `mem` therefore means "the inbox needs draining", a different and more actionable
+    // signal than the old "the index is about to truncate".
     if let Some(stat) = crate::memory::measure(str_at(input, &["transcript_path"])) {
         parts.push(crate::memory::header_segment(&stat));
+    }
+    if let Some(stat) = crate::memory::measure_intuition(str_at(input, &["transcript_path"])) {
+        parts.push(crate::memory::intuition_header_segment(&stat));
     }
     if parts.is_empty() {
         None
@@ -453,6 +460,56 @@ mod tests {
             "charged only {} of {charged_ceiling}",
             day.total
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The two memory gauges must appear together, in inbox-then-curated-store order, and the
+    /// second must vanish entirely on a project that has no `intuition.md`. Neither the
+    /// `memory` unit tests nor the other statusline tests cover this: those exercise the
+    /// gauges in isolation, and every other payload here omits `transcript_path`, so the
+    /// wiring added for the second gauge would otherwise ship unexercised.
+    #[test]
+    fn memory_gauges_render_in_order_and_only_when_their_files_exist() {
+        let dir = std::env::temp_dir().join(format!("quotaline-sl-mem-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let proj = dir.join("proj");
+        std::fs::create_dir_all(proj.join("memory")).unwrap();
+        let transcript = proj.join("s.jsonl");
+        let strip = |s: String| {
+            let mut out = String::new();
+            let mut in_esc = false;
+            for c in s.chars() {
+                match (in_esc, c) {
+                    (false, '\u{1b}') => in_esc = true,
+                    (true, 'm') => in_esc = false,
+                    (false, c) => out.push(c),
+                    _ => {}
+                }
+            }
+            out
+        };
+        let render = || {
+            let v = serde_json::json!({
+                "model": {"display_name": "Opus 5"},
+                "transcript_path": transcript.to_string_lossy(),
+            });
+            strip(header(&v, None).unwrap())
+        };
+
+        std::fs::write(proj.join("memory/MEMORY.md"), "a\nb\n").unwrap();
+        let only_mem = render();
+        assert!(only_mem.contains("mem "), "{only_mem}");
+        assert!(
+            !only_mem.contains("int "),
+            "a project without intuition.md must render no int gauge: {only_mem}"
+        );
+
+        std::fs::write(proj.join("memory/intuition.md"), "x\ny\nz\n").unwrap();
+        let both = render();
+        let m = both.find("mem ").expect("mem gauge missing");
+        let i = both.find("int ").expect("int gauge missing");
+        assert!(m < i, "mem must precede int, got: {both}");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
