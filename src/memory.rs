@@ -1,9 +1,15 @@
 //! Project-memory gauge.
 //!
-//! Claude Code auto-loads `MEMORY.md` every session but **head-truncates** it at 200 lines
-//! or 25,000 UTF-16 code units (JS `.length`), silently dropping the tail past either cap.
-//! This gauge shows how full the index is so you get a warning *before* memory stops
+//! Claude Code auto-loads `MEMORY.md` every session but **head-truncates** it once it exceeds
+//! 200 lines or 25,000 UTF-16 code units (JS `.length`), silently dropping the tail past either
+//! cap. This gauge shows how full the index is so you get a warning *before* memory stops
 //! loading.
+//!
+//! Two details of that measurement the gauge has to match, or it reports on a file the harness
+//! is not looking at. **Exceeds**: the predicate is `>`, so an index sitting exactly on a cap
+//! loads whole and is not truncating. **Trimmed**: both dimensions are counted on
+//! `content.trim()`, and the truncation window is applied to that same trimmed string, so
+//! surrounding whitespace costs nothing and must cost nothing here either.
 //!
 //! The char margin tracks the harness's own threshold rather than a guess at a safe distance
 //! from the cap. After every write to `MEMORY.md` Claude Code fires a `PostToolUse` hook
@@ -89,6 +95,26 @@ fn memory_path(transcript_path: &str, file: &str) -> Option<PathBuf> {
 /// also avoids ever blocking on a pipe. The gauge only needs ~the first 200 lines / 25k units.
 const READ_CAP: u64 = 1 << 20; // 1 MiB
 
+/// Trim the way JS `String.prototype.trim()` does, which is not quite what `str::trim` does.
+///
+/// Two characters differ, and both directions matter because the point of this module is to
+/// report what the harness will do, not what Rust would:
+/// - **U+FEFF** (BOM / ZWNBSP) — JS strips it, Rust does not. A BOM-prefixed index otherwise
+///   blocks `trim_start` entirely, so every leading blank line survives and the count inflates.
+/// - **U+0085** (NEL) — Rust strips it, JS does not. Plain `str::trim` would under-count here.
+///
+/// Neither appears in any index on this machine, and Claude Code's own writes produce neither,
+/// so this buys fidelity rather than fixing an observed failure. It is three lines and removes
+/// the need to reason about which of two trims is in play.
+///
+/// Note there is no correct answer for a fully empty index: the harness's caller guards with
+/// `if (s.trim())` and substitutes a placeholder without measuring, so `SLt` never sees one.
+/// Reporting 1 line / 0 chars is this crate's own convention, chosen because it falls out of
+/// `split('\n')` and is harmless against every threshold.
+fn js_trim(s: &str) -> &str {
+    s.trim_matches(|c: char| (c.is_whitespace() && c != '\u{0085}') || c == '\u{FEFF}')
+}
+
 fn measure_file(transcript_path: Option<&str>, file: &str) -> Option<MemStat> {
     use std::io::Read;
     let path = memory_path(transcript_path?, file)?;
@@ -103,10 +129,27 @@ fn measure_file(transcript_path: Option<&str>, file: &str) -> Option<MemStat> {
         .take(READ_CAP)
         .read_to_string(&mut content)
         .ok()?;
+    // Measure the TRIMMED content, because the harness does: its `SLt()` binds `t = e.trim()`
+    // and counts on `t`, so surrounding whitespace is invisible to it. Counting it here made
+    // every real index on this machine read as fuller than the harness considers it — checked
+    // across 50 of them, all over-reported, most by one line, the worst by three.
+    //
+    // Trimming BOTH ends is deliberate, and the reason is not symmetric with the trailing case.
+    // Trailing whitespace is trivially safe to drop: head-truncation would only have discarded
+    // the empty tail anyway. Leading whitespace would NOT be safe if the harness truncated the
+    // raw string, because head-truncation keeps the first N lines, so leading blanks would eat
+    // the budget and drop real content — and this gauge would then under-report a warranted
+    // red. It does not, and `Klr` is explicit about it: it destructures `trimmed: r` and slices
+    // `r`, not the original — `let a = i ? r.split("\n").slice(0, rle).join("\n") : r`. The
+    // window is applied to the trimmed string, so leading whitespace never costs a line.
+    let trimmed = js_trim(&content);
     Some(MemStat {
-        // split('\n') (not lines()) matches the JS line count Claude Code truncates on.
-        lines: content.split('\n').count(),
-        chars: content.encode_utf16().count(),
+        // split('\n') (not lines()) matches the JS `ju(t, "\n") + 1` the harness truncates on.
+        // They agree on every input including CRLF, since both count only '\n' and both trims
+        // strip the '\r'. On empty input both give 1 — see `js_trim` for why that number is
+        // ours to choose rather than the harness's to dictate.
+        lines: trimmed.split('\n').count(),
+        chars: trimmed.encode_utf16().count(),
     })
 }
 
@@ -119,16 +162,26 @@ pub fn measure(transcript_path: Option<&str>) -> Option<MemStat> {
 ///
 /// Returning `None` is the normal case: only a store that has been migrated to the curated
 /// index has one, so every other project renders the `mem` gauge alone and is unaffected.
+///
+/// It shares `measure_file`, so it is trimmed on the same terms — but *not* for the same
+/// reason. `intuition.md` is mounted through `.claude/rules/` and is not harness-size-capped
+/// at all, so there is no truncation to predict here. Trimming it is a consistency choice: two
+/// gauges side by side must count the same way, or the percentages are not comparable.
 pub fn measure_intuition(transcript_path: Option<&str>) -> Option<MemStat> {
     measure_file(transcript_path, "intuition.md")
 }
 
-/// 0 = within budget, 1 = approaching the cap (amber), 2 = at/over the cap (red).
+/// 0 = within budget, 1 = approaching the cap (amber), 2 = past the cap (red).
 ///
 /// For `MEMORY.md` band 2 means the harness is truncating; for `intuition.md` it means
 /// `/dream` will refuse to add. Different consequences, same three bands.
+///
+/// Band 2 is a strict `>`, matching the harness: `Klr` truncates on `n > rle` / `o > nPe`, so
+/// a file of exactly 200 lines or exactly 25,000 units is loaded WHOLE. Using `>=` here showed
+/// red — "the harness is truncating" — for a file it does not truncate. Band 1 keeps `>=`
+/// because the budgets are our own thresholds and "approaching" is inclusive by construction.
 fn level_for(g: &Gauge, stat: &MemStat) -> u8 {
-    if stat.lines >= g.line_cap || stat.chars >= g.char_cap {
+    if stat.lines > g.line_cap || stat.chars > g.char_cap {
         2
     } else if stat.lines >= g.line_budget || stat.chars >= g.char_budget {
         1
@@ -208,8 +261,11 @@ mod tests {
         assert_eq!(level_for(&MEM_GAUGE, &stat(100, 12_000)), 0);
         assert_eq!(level_for(&MEM_GAUGE, &stat(192, 12_000)), 1); // lines in the budget margin
         assert_eq!(level_for(&MEM_GAUGE, &stat(100, 24_000)), 1); // chars in the budget margin
-        assert_eq!(level_for(&MEM_GAUGE, &stat(200, 12_000)), 2); // line cap → truncating
-        assert_eq!(level_for(&MEM_GAUGE, &stat(100, 25_500)), 2); // char cap → truncating
+                                                                  // Exactly on the line cap is NOT truncating — the harness's predicate is `n > rle`.
+                                                                  // This assertion previously expected 2 and was pinning the off-by-one it now guards.
+        assert_eq!(level_for(&MEM_GAUGE, &stat(200, 12_000)), 1);
+        assert_eq!(level_for(&MEM_GAUGE, &stat(201, 12_000)), 2); // past the line cap
+        assert_eq!(level_for(&MEM_GAUGE, &stat(100, 25_500)), 2); // past the char cap
     }
 
     #[test]
@@ -241,15 +297,26 @@ mod tests {
         // status line has to convey.
         assert_eq!(level_for(&MEM_GAUGE, &stat(128, 22_000)), 1);
         assert_eq!(level_for(&INT_GAUGE, &stat(128, 22_000)), 0);
-        // And the real migrated index (18,828 / 128) is comfortably green on both.
+        // A migrated index of roughly the size this store runs is comfortably green on both.
         assert_eq!(level_for(&INT_GAUGE, &stat(128, 18_828)), 0);
         assert_eq!(level_for(&MEM_GAUGE, &stat(128, 18_828)), 0);
 
         assert_eq!(level_for(&INT_GAUGE, &stat(100, INT_CHAR_BUDGET - 1)), 0);
         assert_eq!(level_for(&INT_GAUGE, &stat(100, INT_CHAR_BUDGET)), 1);
-        assert_eq!(level_for(&INT_GAUGE, &stat(100, INT_CHAR_CAP)), 2);
         assert_eq!(level_for(&INT_GAUGE, &stat(INT_LINE_BUDGET, 100)), 1);
-        assert_eq!(level_for(&INT_GAUGE, &stat(INT_LINE_CAP, 100)), 2);
+
+        // Band 2 is a strict `>`: exactly on a cap is still amber, one past it is red. For
+        // MEM_GAUGE this is harness parity — `Klr` truncates on `n > rle` / `o > nPe`, so a
+        // 200-line index loads whole and must not be reported as truncating. INT_GAUGE's caps
+        // are self-imposed, but they share the predicate so they share the convention.
+        assert_eq!(level_for(&MEM_GAUGE, &stat(LINE_CAP, 100)), 1);
+        assert_eq!(level_for(&MEM_GAUGE, &stat(LINE_CAP + 1, 100)), 2);
+        assert_eq!(level_for(&MEM_GAUGE, &stat(100, CHAR_CAP)), 1);
+        assert_eq!(level_for(&MEM_GAUGE, &stat(100, CHAR_CAP + 1)), 2);
+        assert_eq!(level_for(&INT_GAUGE, &stat(100, INT_CHAR_CAP)), 1);
+        assert_eq!(level_for(&INT_GAUGE, &stat(100, INT_CHAR_CAP + 1)), 2);
+        assert_eq!(level_for(&INT_GAUGE, &stat(INT_LINE_CAP, 100)), 1);
+        assert_eq!(level_for(&INT_GAUGE, &stat(INT_LINE_CAP + 1, 100)), 2);
     }
 
     #[test]
@@ -295,11 +362,107 @@ mod tests {
         t.write("intuition.md", "x\ny\n");
         let m = measure(Some(&t.transcript())).unwrap();
         let i = measure_intuition(Some(&t.transcript())).unwrap();
-        assert_eq!((m.lines, m.chars), (4, 6));
-        assert_eq!((i.lines, i.chars), (3, 4));
+        // Trimmed: "a\nb\nc" is 3 lines / 5 units, "x\ny" is 2 / 3. The trailing newline is
+        // not counted, because the harness does not count it either.
+        assert_eq!((m.lines, m.chars), (3, 5));
+        assert_eq!((i.lines, i.chars), (2, 3));
 
         assert!(measure(None).is_none());
         assert!(measure_intuition(None).is_none());
+    }
+
+    #[test]
+    fn counts_ignore_surrounding_whitespace_because_the_harness_trims_first() {
+        // The harness binds `t = e.trim()` before counting either dimension, so a file that
+        // ends in blank lines is no fuller to it than the same file without them. Counting
+        // them made this gauge disagree with the thing it exists to track — every real index
+        // on this machine over-reported, most by one line.
+        let t = TempDir::new("trim");
+
+        t.write("MEMORY.md", "a\nb\nc");
+        let tight = measure(Some(&t.transcript())).unwrap();
+
+        // Same content, padded at both ends. Must measure identically.
+        t.write("MEMORY.md", "\n\n  a\nb\nc\n\n\n");
+        let padded = measure(Some(&t.transcript())).unwrap();
+        assert_eq!(
+            (tight.lines, tight.chars),
+            (padded.lines, padded.chars),
+            "padding changed the measurement; the harness would not have seen it"
+        );
+        assert_eq!((tight.lines, tight.chars), (3, 5));
+    }
+
+    #[test]
+    fn trimming_follows_js_not_rust_on_the_two_chars_they_disagree_about() {
+        // `js_trim` exists only for these two characters; without a test, reverting it to
+        // `str::trim` would break nothing and the fidelity claim would be unfalsifiable.
+        let t = TempDir::new("jstrim");
+
+        // U+FEFF: JS strips it, Rust does not. Left unstripped it also blocks trim_start, so
+        // the leading blank line survives and the count inflates as well as the char total.
+        t.write("MEMORY.md", "\u{FEFF}\na\nb\n");
+        let bom = measure(Some(&t.transcript())).unwrap();
+        assert_eq!(
+            (bom.lines, bom.chars),
+            (2, 3),
+            "a BOM must be stripped like JS does, not retained like str::trim does"
+        );
+
+        // U+0085 (NEL): Rust strips it, JS does not. It must survive, and it is one UTF-16
+        // unit that the harness would count.
+        t.write("MEMORY.md", "a\nb\u{0085}");
+        let nel = measure(Some(&t.transcript())).unwrap();
+        assert_eq!(
+            (nel.lines, nel.chars),
+            (2, 4),
+            "NEL must be retained like JS does, not stripped like str::trim does"
+        );
+    }
+
+    #[test]
+    fn a_full_but_untruncated_index_reads_amber_not_red() {
+        // The bug this module's trim fixes, stated as behaviour rather than as a count. Before
+        // it, an index of LINE_CAP - 1 content lines with the ordinary trailing newline counted
+        // LINE_CAP and went RED — "the harness is truncating" — for a file the harness reads in
+        // full. Every other banding test builds `MemStat` by hand, so nothing else connects a
+        // file on disk to a colour, and without this the fix could be silently undone.
+        let t = TempDir::new("fullish");
+        t.write("MEMORY.md", &"x\n".repeat(LINE_CAP - 1));
+
+        let s = measure(Some(&t.transcript())).unwrap();
+        assert_eq!(
+            s.lines,
+            LINE_CAP - 1,
+            "the trailing newline must not add a line"
+        );
+        assert_eq!(
+            level_for(&MEM_GAUGE, &s),
+            1,
+            "a file the harness loads whole must not be reported as truncating"
+        );
+    }
+
+    #[test]
+    fn an_empty_index_measures_as_one_line_like_the_harness() {
+        // 1, not 0 — and by our own convention rather than harness parity. The harness never
+        // measures an empty index at all: its caller guards with `if (s.trim())` and pushes a
+        // "currently empty" placeholder instead, so there is no reference answer to match. 1 is
+        // simply what `split('\n')` yields and is harmless against every threshold. Pinned so a
+        // later switch to `lines()` (which yields 0) cannot change it unnoticed.
+        let t = TempDir::new("empty");
+
+        t.write("MEMORY.md", "");
+        let empty = measure(Some(&t.transcript())).unwrap();
+        assert_eq!((empty.lines, empty.chars), (1, 0));
+
+        t.write("MEMORY.md", "\n\n  \n");
+        let blank = measure(Some(&t.transcript())).unwrap();
+        assert_eq!(
+            (blank.lines, blank.chars),
+            (1, 0),
+            "a whitespace-only file trims to empty and measures the same"
+        );
     }
 
     #[test]

@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **The memory gauges now measure a file the way Claude Code measures it.** Two disagreements,
+  both making the gauge read fuller or redder than the harness ever would.
+
+  *Whitespace.* The harness binds `t = content.trim()` and counts lines and UTF-16 units on
+  `t`, and — this is the part that matters — applies the truncation window to that same trimmed
+  string (`r.split("\n").slice(0, 200)`). This gauge counted the raw file. Since practically
+  every index ends in a newline, practically every index over-reported: across the 50 on the
+  development machine, all of them, most by one line and the worst by three. Trimming both ends
+  is therefore safe, not just the trailing end: leading blank lines cannot consume the
+  truncation budget because they are gone before the window is applied.
+
+  *Boundary.* `level_for` used `>=` against the caps while the harness truncates on `>`. An
+  index of exactly 200 lines or exactly 25,000 units loads **whole**, but the status line
+  showed red — "the harness is truncating" — for it. Combined with the counting bug this was
+  reachable by an ordinary file: 199 content lines plus the usual trailing newline counted 200
+  and went red, with nothing actually being dropped. Band 1 keeps `>=`, because those
+  thresholds are ours and "approaching" is inclusive by construction.
+
+  Trimming now follows JS `String.prototype.trim()` rather than Rust's `str::trim`, which
+  differ on U+FEFF (JS strips, Rust does not) and U+0085 (Rust strips, JS does not). Neither
+  appears in any real index; this buys fidelity rather than fixing an observed failure.
+
+  Displayed numbers move for most users — typically one line and one or two percentage points,
+  always downward. No index on the development machine changes band as a result.
+
 ## [1.3.0] - 2026-08-06
 
 ### Added
