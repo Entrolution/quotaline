@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- The memory gauge stayed **green while Claude Code was already asking for a compaction**.
+  The amber threshold was 23,500 characters, chosen as a margin below the documented 25,000
+  cap, but the harness starts nagging well before that. After each write to `MEMORY.md` it
+  fires a hook saying the index is "approaching the 24.4KB read limit" and asking for it to be
+  compacted "to under 17.1KB". Across 13 of those firings in three projects (2026-07-04 to
+  2026-08-05) the smallest reported size was 19.5KB, and 80% of the cap is 19.53KB, so the
+  real trigger is 20,000 units and the harness's own target is 17,500 (70%). `CHAR_BUDGET` is
+  now 20,000, so the gauge and the harness go amber together instead of the status line
+  reading green through 3,500 units of nagging. `CHAR_CAP` stays at 25,000: that is still the
+  documented truncation point and the right red line. The line margin is unchanged at 190,
+  because no line-dimension trigger appears in any of the firings.
+
 ## [1.2.0] - 2026-08-01
 
 ### Fixed

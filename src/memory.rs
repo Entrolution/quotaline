@@ -3,7 +3,15 @@
 //! Claude Code auto-loads `MEMORY.md` every session but **head-truncates** it at 200 lines
 //! or 25,000 UTF-16 code units (JS `.length`), silently dropping the tail past either cap.
 //! This gauge shows how full the index is so you get a warning *before* memory stops
-//! loading. The `dream --refine` design targets a safety margin of 190 lines / 23,500 chars.
+//! loading.
+//!
+//! The char margin tracks the harness's own threshold rather than a guess at a safe distance
+//! from the cap. After every write to `MEMORY.md` Claude Code fires a `PostToolUse` hook
+//! nagging that the index is "approaching the read limit", and that fires at 80% of the cap,
+//! so `CHAR_BUDGET` is 80% and the gauge stops being green at the moment the harness starts
+//! complaining. `LINE_BUDGET` keeps its old 190: no firing has ever cited the line dimension,
+//! so there is nothing measured to move it to. The derivation is in the CHANGELOG entry that
+//! set these, and `char_budget_tracks_the_measured_trigger` pins the ratio.
 
 use std::path::{Path, PathBuf};
 
@@ -12,7 +20,10 @@ use crate::fmt::{AMBER, DIM, GREEN, RED, RESET};
 pub const LINE_CAP: usize = 200;
 pub const CHAR_CAP: usize = 25_000;
 pub const LINE_BUDGET: usize = 190;
-pub const CHAR_BUDGET: usize = 23_500;
+/// The harness's own "approaching the read limit" trigger, 80% of `CHAR_CAP`. Do not raise
+/// this without new firing data: the gauge exists to warn before the harness does, and at
+/// its previous 23,500 it did not.
+pub const CHAR_BUDGET: usize = 20_000;
 
 pub struct MemStat {
     pub lines: usize,
@@ -95,8 +106,30 @@ mod tests {
     }
 
     #[test]
+    fn amber_starts_exactly_at_the_harness_trigger() {
+        // The gauge must not be green while Claude Code is already asking for a compaction.
+        assert_eq!(level(&stat(100, CHAR_BUDGET - 1)), 0);
+        assert_eq!(level(&stat(100, CHAR_BUDGET)), 1);
+        // The old 23,500 budget sat 3,500 units above the trigger: this is the regression.
+        assert_eq!(level(&stat(100, 20_000)), 1);
+        assert_eq!(level(&stat(100, 23_499)), 1);
+    }
+
+    #[test]
+    fn char_budget_tracks_the_measured_trigger() {
+        // 13 `PostToolUse` firings across three projects, 2026-07-04 to 2026-08-05. The
+        // smallest reported "approaching" size was 19.5KB and 80% of the cap is 19.53KB, so
+        // the harness warns at 20,000 units. Its stated compaction target, "under 17.1KB",
+        // is 70% of the same cap, which corroborates the round-percentage reading.
+        // Failing here means the budget moved without new firing data behind it.
+        assert_eq!(CHAR_BUDGET, CHAR_CAP * 4 / 5);
+    }
+
+    #[test]
     fn header_uses_binding_dimension() {
-        // chars dominate: 20000/25000 = 80% vs lines 100/200 = 50%
+        // chars dominate: 20000/25000 = 80% vs lines 100/200 = 50%. Note 20,000 is now also
+        // the amber boundary, so this segment is amber; the assertions below are about the
+        // percentage arithmetic, which is cap-denominated and independent of the colour.
         let seg = header_segment(&stat(100, 20_000));
         assert!(seg.contains("80%"), "{seg}");
         assert!(seg.contains("(100ln)"), "{seg}");
