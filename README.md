@@ -91,9 +91,14 @@ contaminates the subscription report's $-headroom anchor (nor vice versa).
 `mem N% (Xln)` tracks the current project's `MEMORY.md` — the index Claude Code auto-loads
 every session. Claude Code **head-truncates** it at **200 lines or 25,000 characters**
 (whichever comes first), silently dropping the rest, so an oversized index means memory
-stops loading. The gauge turns amber as you approach the cap (a 190-line / 23,500-char safety
-margin) and red once it's truncating — your cue to trim or consolidate the index. Shown only
-when the project has a `MEMORY.md`.
+stops loading. The gauge turns amber at **20,000 characters or 190 lines** and red once it's
+truncating. That's your cue to trim or consolidate the index. Shown only when the project has
+a `MEMORY.md`.
+
+The 20,000 is measured, not chosen. Claude Code itself nags after a write when the index is
+"approaching the 24.4KB read limit", and across 13 of those firings the smallest reported size
+was 19.5KB, i.e. 80% of the cap. The gauge is set to the same point so it stops being green
+while the harness is already complaining.
 
 ## Install
 
