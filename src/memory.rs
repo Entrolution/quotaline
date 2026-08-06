@@ -7,11 +7,15 @@
 //!
 //! The char margin tracks the harness's own threshold rather than a guess at a safe distance
 //! from the cap. After every write to `MEMORY.md` Claude Code fires a `PostToolUse` hook
-//! nagging that the index is "approaching the read limit", and that fires at 80% of the cap,
-//! so `CHAR_BUDGET` is 80% and the gauge stops being green at the moment the harness starts
-//! complaining. `LINE_BUDGET` keeps its old 190: no firing has ever cited the line dimension,
-//! so there is nothing measured to move it to. The derivation is in the CHANGELOG entry that
-//! set these, and `char_budget_tracks_the_measured_trigger` pins the ratio.
+//! nagging that the index is "approaching the read limit". The smallest index ever observed
+//! to trigger it sits just under 80% of the cap, close enough to read as a round-number
+//! threshold, so `CHAR_BUDGET` is 80% and the gauge stops being green at about the moment the
+//! harness starts complaining. That reading is an inference, not a number read out of the
+//! harness: what is directly observed is an upper bound on the trigger, and the true value is
+//! at or below where the budget now sits. `LINE_BUDGET` keeps its old 190: no firing has ever
+//! cited the line dimension, so there is nothing measured to move it to. The derivation is in
+//! the CHANGELOG entry that set these, and `char_budget_tracks_the_measured_trigger` pins the
+//! ratio.
 
 use std::path::{Path, PathBuf};
 
