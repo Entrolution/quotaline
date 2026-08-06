@@ -95,10 +95,12 @@ stops loading. The gauge turns amber at **20,000 characters or 190 lines** and r
 truncating. That's your cue to trim or consolidate the index. Shown only when the project has
 a `MEMORY.md`.
 
-The 20,000 is measured, not chosen. Claude Code itself nags after a write when the index is
-"approaching the 24.4KB read limit", and across 13 of those firings the smallest reported size
-was 19.5KB, i.e. 80% of the cap. The gauge is set to the same point so it stops being green
-while the harness is already complaining.
+The 20,000 comes from the harness's own behaviour rather than a round number picked for
+comfort. Claude Code nags after a write when the index is "approaching the 24.4KB read limit",
+and across 13 of those firings the smallest reported size was 19.5KB, close to 80% of the cap.
+The gauge is set to that point so it stops being green while the harness is already
+complaining. Those firings only appear once an index is already over the line, so 19.5KB is an
+upper bound on the real trigger rather than the trigger itself.
 
 ## Install
 
