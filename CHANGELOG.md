@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-08-06
+
 ### Added
 
 - **`int N% (Xln)`, a second memory gauge**, shown next to `mem` when the project's memory
@@ -152,7 +154,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   into `~/.claude/settings.json`.
 - Release pipeline and binary-downloader installers for macOS, Linux and Windows.
 
-[Unreleased]: https://github.com/Entrolution/quotaline/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/Entrolution/quotaline/compare/v1.3.0...HEAD
+[1.3.0]: https://github.com/Entrolution/quotaline/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/Entrolution/quotaline/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/Entrolution/quotaline/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/Entrolution/quotaline/releases/tag/v1.0.0
