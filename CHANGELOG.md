@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`int N% (Xln)`, a second memory gauge**, shown next to `mem` when the project's memory
+  directory contains an `intuition.md`. That file is a curated always-loaded index mounted
+  through `.claude/rules/`, which the harness does not size-cap, so unlike `mem` its
+  thresholds are chosen rather than imposed: amber at 25,000 characters or 200 lines, red at
+  28,000. Red means the curation tooling will refuse to add, not that anything is being
+  truncated. The line rail is set so its budget-to-cap headroom matches the char dimension
+  (200/224 == 25000/28000), because chars are what bind and a mismatched line rail would go
+  amber first and make the percentage meaningless.
+
+  Both gauges now share one implementation behind a small `Gauge` descriptor instead of a
+  copy, and the percentage stays cap-denominated in both so two numbers printed side by side
+  in the same format mean the same thing. Projects without an `intuition.md` render exactly
+  as before: `measure_intuition` returns `None` and the segment is omitted.
+
+  Read the pair as a flow, inbox then curated store. Where the split is in use, a large `mem`
+  means the inbox needs draining rather than the index being about to truncate.
+
 ### Fixed
 
 - The memory gauge stayed **green while Claude Code was already asking for a compaction**.

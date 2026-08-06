@@ -102,6 +102,25 @@ The gauge is set to that point so it stops being green while the harness is alre
 complaining. Those firings only appear once an index is already over the line, so 19.5KB is an
 upper bound on the real trigger rather than the trigger itself.
 
+### Intuition gauge
+
+`int N% (Xln)` appears alongside `mem` when the project's memory directory contains an
+`intuition.md`, and is simply absent otherwise, so projects that don't use one see no change:
+
+```
+mem 14% (29ln) · int 67% (128ln)
+```
+
+`intuition.md` is a curated always-loaded index mounted through `.claude/rules/`, which the
+harness does **not** size-cap. Its thresholds are therefore chosen rather than imposed: amber
+at **25,000 characters or 200 lines**, red at 28,000. Going red doesn't mean anything is being
+truncated, it means the curation tooling will refuse to add rather than overflow, which is a
+visible failure instead of a silently dropped tail.
+
+Read the pair left to right as a flow. Claude writes to `MEMORY.md`, curation promotes into
+`intuition.md`. On such a project a large `mem` no longer means "the index is about to
+truncate", it means **the inbox needs draining**, which is a more actionable thing to be told.
+
 ## Install
 
 Requires a recent **Claude Code**: on a **Pro or Max** plan you get the limit bars (the
