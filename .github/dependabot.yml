@@ -1,0 +1,36 @@
+version: 2
+
+# Why this exists: every action in these workflows had drifted onto the Node 20 runtime and
+# only surfaced as a per-job deprecation warning that nobody was reading. Bumping four of them
+# by hand is the failure mode this file prevents. It matters more now that
+# dtolnay/rust-toolchain is pinned to a commit SHA: a SHA nothing ever refreshes is frozen,
+# not maintained, and Dependabot updates SHA pins in place while preserving the trailing
+# comment that says what the SHA is.
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    # One PR for the lot rather than four. These move together in practice — the artifact
+    # actions in particular must stay a compatible pair (upload v7 <-> download v8), and
+    # reviewing them separately is how a mismatched pair gets merged.
+    groups:
+      actions:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: ci
+
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      cargo:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+    commit-message:
+      prefix: deps
