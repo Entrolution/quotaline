@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A session that switched billing mid-life could stay held forever, instead of for
+  `SUB_HOLD_SECS`.** The hold that stops a resumed subscription session's shadow counter being
+  presented as spend lifts only once that session's *own* cost is observed moving with no
+  windows — which takes at least two observations, 45 minutes apart. Only the first of those
+  was exempt from the shared throttle, via `changes_shape`; every later probe competed for a
+  slot that is global across sessions.
+
+  So the failure needed no unusual input, only a second busy session. A peer rendering on the
+  same timer takes the slot every minute, the switched session is never observed moving, and
+  the proof the hold waits for can never be assembled. The wait stops being a 45-minute one and
+  becomes permanent: the status line shows `limits n/a` for the life of the session and real
+  API-key spend never reaches the day total. Observed on a machine running four concurrent
+  sessions, where the switched one logged its anchor and exactly one probe and then nothing.
+
+  Later probes from a held session now take a per-session slot too, bounded exactly as
+  `changes_shape` is — one extra write per minute per session — and gated on the counter having
+  actually moved, so a frozen resume transient still cannot churn the retention cap.
+
 ## [1.3.1] - 2026-08-07
 
 ### Fixed

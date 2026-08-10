@@ -389,6 +389,15 @@ pub fn log_sample(dir: &Path, input: &Value, now: i64) {
     let sid = session_key(input.get("session_id").and_then(|x| x.as_str()));
     let subs = SubSessions::build(&hist);
 
+    // A session that recently reported window data stays a subscription session until its
+    // own cost counter proves the billing changed for good (see [`SubSessions::hold`]).
+    // Decided here, before the throttle, because the verdict governs two separate things:
+    // whether this sample may take a slot at all, and whether it may count as spend.
+    let held = api
+        && sid
+            .as_ref()
+            .is_some_and(|k| subs.hold(k, usd, now).is_some());
+
     // A sample that records a session *changing* billing shape is exempt from the shared
     // throttle slot. The throttle is global, and with several sessions rendering on the same
     // timer one can hold the slot indefinitely — which would be a lost data point for any
@@ -404,7 +413,28 @@ pub fn log_sample(dir: &Path, input: &Value, now: i64) {
             .is_some_and(|(t, was_sub)| {
                 was_sub != (mode == Mode::Subscription) && t <= now.saturating_sub(SAMPLE_INTERVAL)
             });
-    if !changes_shape {
+
+    // Every *later* probe from a held session needs the same exemption, for the same reason
+    // one step on. `changes_shape` only ever fires once — the first window-less sample after
+    // the windows stop — but the hold lifts on the counter being seen to *move*, which takes
+    // at least two observations spanning SUB_HOLD_SECS. Those later probes are not a shape
+    // change, so under the global slot a busier session can take every minute and the
+    // switched one is never observed moving: the hold then never lifts at all, rather than
+    // lifting after SUB_HOLD_SECS, and real API-key spend stays invisible for the life of
+    // the session. Bounded exactly as `changes_shape` is — one extra write per minute per
+    // session — and gated on the counter having actually moved, so a frozen resume transient
+    // still cannot churn the retention cap. That gate duplicates the frozen-counter return
+    // below and is deliberately kept: it states the exemption's bound where the exemption is
+    // granted, rather than leaving it to hold only for as long as a later guard stays put.
+    let hold_probe = held
+        && sid.as_ref().is_some_and(|k| {
+            subs.last_cost(k) != usd
+                && subs
+                    .last_sample(k)
+                    .is_none_or(|(t, _)| t <= now.saturating_sub(SAMPLE_INTERVAL))
+        });
+
+    if !changes_shape && !hold_probe {
         if let Some(last) = hist.last() {
             // Overflow-safe (stored t is untrusted): equivalent to `now - last.t < INTERVAL`.
             if last.t > now.saturating_sub(SAMPLE_INTERVAL) {
@@ -413,25 +443,19 @@ pub fn log_sample(dir: &Path, input: &Value, now: i64) {
         }
     }
 
-    // A session that recently reported window data stays a subscription session until its
-    // own cost counter proves the billing changed for good (see [`SubSessions::hold`]).
-    // Until then the sample is still written, just demoted to a window-less *probe*: it can
-    // never count as spend, and it is the observation that proof is later built from.
-    // Dropping the sample instead — as this once did — left a switched session invisible in
-    // the history and the question permanently unanswerable.
-    if api {
-        if let Some(k) = &sid {
-            if subs.hold(k, usd, now).is_some() {
-                api = false;
-                // Only a counter that has *moved* is worth a slot. The first probe anchors
-                // the comparison and every later movement extends it, but a resumed session
-                // can sit frozen for hours, and repeating that value would churn ~1/min
-                // through the retention cap — evicting the very window samples the hold
-                // rests on, after which nothing holds the session at all.
-                if usd.is_some() && subs.last_cost(k) == usd {
-                    return;
-                }
-            }
+    // Until that proof lands the sample is still written, just demoted to a window-less
+    // *probe*: it can never count as spend, and it is the observation that proof is later
+    // built from. Dropping the sample instead — as this once did — left a switched session
+    // invisible in the history and the question permanently unanswerable.
+    if held {
+        api = false;
+        // Only a counter that has *moved* is worth a slot. The first probe anchors the
+        // comparison and every later movement extends it, but a resumed session can sit
+        // frozen for hours, and repeating that value would churn ~1/min through the
+        // retention cap — evicting the very window samples the hold rests on, after which
+        // nothing holds the session at all.
+        if usd.is_some() && sid.as_ref().is_some_and(|k| subs.last_cost(k) == usd) {
+            return;
         }
     }
 
@@ -838,6 +862,93 @@ mod tests {
         peer(1200);
         log_sample(&d.0, &payload(sid, 6.0, true), 1230);
         assert_eq!(read_history(&d.0).len(), 6);
+    }
+
+    #[test]
+    fn a_held_sessions_later_probes_are_never_lost_to_the_shared_throttle() {
+        // `changes_shape` exempts only the *first* window-less sample. The hold lifts on the
+        // counter being seen to move, which needs a second observation SUB_HOLD_SECS after
+        // the first movement — and that one is not a shape change. Under the global slot
+        // alone a busy peer takes every minute, the movement is never observed, and the
+        // switch is never proven: the hold stops being a SUB_HOLD_SECS wait and becomes
+        // permanent, hiding real API-key spend for the life of the session.
+        let d = TempDir::new("holdprobe");
+        let sid = "switcher-abc";
+        let peer = |t| log_sample(&d.0, &payload("peer-session", 1.0, true), t);
+
+        log_sample(&d.0, &payload(sid, 5.0, true), 0); // on the subscription
+        peer(1000);
+        log_sample(&d.0, &payload(sid, 5.0, false), 1030); // first probe: the shape change
+        assert_eq!(read_history(&d.0).len(), 3);
+
+        // From here a peer contends for the shared slot every single minute. Run well past
+        // the point where the hold becomes provable (+600s, ten intervals) rather than
+        // stopping on it: the release turns on `now - moved_at >= SUB_HOLD_SECS`, and a loop
+        // ending exactly there proves the release only at a boundary equality, so a one-tick
+        // change anywhere would break the test for a reason unrelated to what it covers.
+        let mut t = 1090;
+        let mut cost = 5.0;
+        while t < 1030 + SUB_HOLD_SECS + 600 {
+            peer(t);
+            cost += 0.25;
+            log_sample(&d.0, &payload(sid, cost, false), t + 30);
+            t += 60;
+        }
+
+        let h = read_history(&d.0);
+        let mine: Vec<&Sample> = h
+            .iter()
+            .filter(|s| s.sid.as_deref() == Some("switcher-abc"))
+            .collect();
+        // Without the exemption this session lands its anchor and one probe and then nothing,
+        // so the count is the assertion: a couple of extra samples would be indistinguishable
+        // from noise, dozens can only mean the probes kept their slot for the whole run.
+        assert!(
+            mine.len() > 30,
+            "moving probes kept landing while a peer contended, got {}",
+            mine.len()
+        );
+        assert!(
+            mine.iter().filter(|s| s.api).count() >= 3,
+            "the hold released on observed movement and stayed released, got {} spend samples",
+            mine.iter().filter(|s| s.api).count()
+        );
+        // The release must come from the proof, not from retention quietly evicting the
+        // windowed sample the hold reasons about — that would pass this test for the one
+        // reason it is meant to rule out.
+        assert!(
+            h.iter()
+                .any(|s| has_window_data(s) && s.sid.as_deref() == Some("switcher-abc")),
+            "the subscription anchor survived, so the hold was released by proof"
+        );
+    }
+
+    #[test]
+    fn a_frozen_hold_probe_still_waits_its_turn() {
+        // A resumed session sitting on a frozen counter must write nothing, however long it
+        // idles: that is the churn that would evict the very window samples the hold reasons
+        // from, after which nothing holds the session at all.
+        //
+        // This pins the outcome, not the mechanism, and deliberately so — two guards produce
+        // it (the moved-counter gate on the throttle exemption, and the frozen-counter return
+        // after it), so removing either alone leaves this test green. Asserting on which one
+        // fired would couple the test to an ordering neither guard promises.
+        let d = TempDir::new("frozenprobe");
+        let sid = "frozen-sess";
+        let peer = |t| log_sample(&d.0, &payload("peer-session", 1.0, true), t);
+
+        log_sample(&d.0, &payload(sid, 5.0, true), 0);
+        peer(1000);
+        log_sample(&d.0, &payload(sid, 5.0, false), 1030); // first probe (shape change)
+        let n = read_history(&d.0).len();
+
+        peer(1100);
+        log_sample(&d.0, &payload(sid, 5.0, false), 1130); // same counter: no free slot
+        assert_eq!(
+            read_history(&d.0).len(),
+            n + 1,
+            "only the peer's sample was added"
+        );
     }
 
     #[test]
