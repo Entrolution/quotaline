@@ -422,13 +422,20 @@ pub fn log_sample(dir: &Path, input: &Value, now: i64) {
     // switched one is never observed moving: the hold then never lifts at all, rather than
     // lifting after SUB_HOLD_SECS, and real API-key spend stays invisible for the life of
     // the session. Bounded exactly as `changes_shape` is — one extra write per minute per
-    // session — and gated on the counter having actually moved, so a frozen resume transient
-    // still cannot churn the retention cap. That gate duplicates the frozen-counter return
-    // below and is deliberately kept: it states the exemption's bound where the exemption is
-    // granted, rather than leaving it to hold only for as long as a later guard stays put.
+    // session — and gated on the counter having climbed, so a frozen resume transient still
+    // cannot churn the retention cap.
+    //
+    // "Climbed", not merely "differs", so that this agrees with what [`SubSessions::hold`]
+    // will actually accept as proof: it releases on `u > first_move`, so a slot spent on a
+    // counter that went *down* buys evidence the release can never use. Cumulative counters
+    // do not fall, and a payload where one appears to is a clock step rather than a refund —
+    // which is exactly the case worth spending no slot on. The gate overlaps the
+    // frozen-counter return below and is deliberately kept: it states the exemption's bound
+    // where the exemption is granted, rather than leaving it to hold for only as long as a
+    // later guard stays put.
     let hold_probe = held
         && sid.as_ref().is_some_and(|k| {
-            subs.last_cost(k) != usd
+            usd.is_some_and(|u| subs.last_cost(k).is_none_or(|prev| u > prev))
                 && subs
                     .last_sample(k)
                     .is_none_or(|(t, _)| t <= now.saturating_sub(SAMPLE_INTERVAL))
@@ -881,37 +888,51 @@ mod tests {
         log_sample(&d.0, &payload(sid, 5.0, false), 1030); // first probe: the shape change
         assert_eq!(read_history(&d.0).len(), 3);
 
-        // From here a peer contends for the shared slot every single minute. Run well past
-        // the point where the hold becomes provable (+600s, ten intervals) rather than
-        // stopping on it: the release turns on `now - moved_at >= SUB_HOLD_SECS`, and a loop
-        // ending exactly there proves the release only at a boundary equality, so a one-tick
-        // change anywhere would break the test for a reason unrelated to what it covers.
+        // The peer writes one second before every probe, on a 61-second step. That spacing is
+        // the whole load-bearing part of this test: at each probe the session's own last
+        // sample is 61s old, so the exemption's per-session gate is open, while the shared
+        // slot was claimed one second ago, so the ordinary throttle would refuse it. Every
+        // probe below therefore lands only if `hold_probe` grants it a slot.
+        //
+        // The obvious schedule — peer and probe both on a 60s step — does NOT test this, and
+        // silently. A probe that lands sets `hist.last()` to its own timestamp; 60s later the
+        // ordinary throttle admits the next one on the boundary (`last.t > now - INTERVAL` is
+        // false at equality), so the session sustains its own cadence, the peer never gets
+        // the slot back, and the exemption stops mattering after the first write. An
+        // implementation whose exemption worked once and then did nothing passed that
+        // version of this test.
         let mut t = 1090;
         let mut cost = 5.0;
         while t < 1030 + SUB_HOLD_SECS + 600 {
             peer(t);
             cost += 0.25;
-            log_sample(&d.0, &payload(sid, cost, false), t + 30);
-            t += 60;
+            log_sample(&d.0, &payload(sid, cost, false), t + 1);
+            t += 61;
         }
+
+        // The peer stops contending. With the switch now proven the next probe needs no
+        // exemption: it wins the ordinary slot on its own, and is recorded as spend rather
+        // than demoted to a probe.
+        cost += 0.25;
+        log_sample(&d.0, &payload(sid, cost, false), t + 300);
 
         let h = read_history(&d.0);
         let mine: Vec<&Sample> = h
             .iter()
             .filter(|s| s.sid.as_deref() == Some("switcher-abc"))
             .collect();
-        // Without the exemption this session lands its anchor and one probe and then nothing,
-        // so the count is the assertion: a couple of extra samples would be indistinguishable
-        // from noise, dozens can only mean the probes kept their slot for the whole run.
+        // Under the schedule above the count is the assertion. Without the exemption this
+        // session lands its anchor and one probe and then nothing (2); with an exemption that
+        // fires and then stops, a handful. Only an exemption granting a slot on every
+        // contended tick reaches dozens.
         assert!(
-            mine.len() > 30,
-            "moving probes kept landing while a peer contended, got {}",
+            mine.len() > 40,
+            "every contended probe landed on the exemption, got {}",
             mine.len()
         );
         assert!(
-            mine.iter().filter(|s| s.api).count() >= 3,
-            "the hold released on observed movement and stayed released, got {} spend samples",
-            mine.iter().filter(|s| s.api).count()
+            mine.last().is_some_and(|s| s.api),
+            "the hold released on proven movement, so the final probe counts as spend"
         );
         // The release must come from the proof, not from retention quietly evicting the
         // windowed sample the hold reasons about — that would pass this test for the one
