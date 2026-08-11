@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A busy session's writes could starve every other session's out of the shared history
+  file, indefinitely.** The write throttle was gated on the single most-recent entry in the
+  whole file, regardless of which session wrote it. A session rendering on a clean cadence
+  could win that shared slot on nearly every tick, and for as long as it kept doing so, no
+  other concurrently-running session could persist its own current cost — even while actively
+  spending. Since each pane's `day` total is its own live cost plus everyone else's
+  last-written cost, a starved session read minutes (in the worst observed case, 30-40+)
+  stale in every *other* pane while its own pane's figure kept climbing, and the machine-wide
+  `day` total undercounted for as long as the starvation lasted.
+
+  The throttle now keys on this session's own most recent entry rather than the shared one
+  (falling back to the old shared-slot check only for the rare sample with no session id at
+  all), bounding staleness to one throttle interval per session regardless of what peers are
+  doing. This also subsumes the 1.3.2 fix below — `changes_shape` and `hold_probe` existed to
+  patch the identical starvation problem for one narrow case, and are now redundant and
+  removed. `MAX_ENTRIES_API` grows from 1500 to 12,500 to keep the day figure's full 26h
+  lookback intact now that write volume scales with concurrent-session count rather than a
+  fixed global 1/min.
+
+- **The API-key header's dollar figure could read as directly comparable to the `day` line
+  and isn't.** It's the session's own lifetime cost — which can span multiple days across a
+  `--resume` — sitting right above a line that means something narrower: today's movement,
+  summed across every session. A long-running session's all-time total can legitimately
+  exceed a same-day cross-session sum without either number being wrong; the header now reads
+  `sess $X` to make the distinction visible instead of silently confusing.
+
 ## [1.3.2] - 2026-08-10
 
 ### Fixed
