@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.3] - 2026-08-11
+
 ### Fixed
 
 - **A busy session's writes could starve every other session's out of the shared history
@@ -236,7 +238,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   into `~/.claude/settings.json`.
 - Release pipeline and binary-downloader installers for macOS, Linux and Windows.
 
-[Unreleased]: https://github.com/Entrolution/quotaline/compare/v1.3.2...HEAD
+[Unreleased]: https://github.com/Entrolution/quotaline/compare/v1.3.3...HEAD
+[1.3.3]: https://github.com/Entrolution/quotaline/compare/v1.3.2...v1.3.3
 [1.3.2]: https://github.com/Entrolution/quotaline/compare/v1.3.1...v1.3.2
 [1.3.1]: https://github.com/Entrolution/quotaline/compare/v1.3.0...v1.3.1
 [1.3.0]: https://github.com/Entrolution/quotaline/compare/v1.2.0...v1.3.0
