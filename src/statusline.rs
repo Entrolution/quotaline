@@ -59,7 +59,7 @@ fn ctx_color(abs_tok: Option<f64>, pct: Option<f64>) -> &'static str {
 }
 
 /// Compact `Model · effort: level · ctx N% (size)` header; `None` if all absent.
-/// `session_usd` (API-key mode only) appends the session's real billed cost.
+/// `session_usd` (API-key mode only) appends the session's real billed cost as `sess $X`.
 fn header(input: &Value, session_usd: Option<f64>) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
     if let Some(model) = str_at(input, &["model", "display_name"]) {
@@ -87,7 +87,13 @@ fn header(input: &Value, session_usd: Option<f64>) -> Option<String> {
         ));
     }
     if let Some(u) = session_usd {
-        parts.push(fmt_usd(u));
+        // Labelled, not a bare `$`: this is the session's own lifetime cost (it can span
+        // multiple days across a `--resume`), and it sits right above a `day` line that
+        // means something narrower — today's movement, summed across every session. A bare
+        // dollar figure reads as directly comparable to `day` and isn't; a long-running
+        // session's all-time total can exceed a same-day cross-session sum without either
+        // number being wrong.
+        parts.push(format!("{DIM}sess {RESET}{}", fmt_usd(u)));
     }
     // `mem` then `int`, matching the direction of flow: Claude writes to MEMORY.md as an
     // inbox and `/dream` drains it into the curated intuition.md. On a migrated store a large

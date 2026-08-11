@@ -1,12 +1,15 @@
 //! The usage-history log, shared with `report` and the inline burn-rate readout.
 //!
-//! Best-effort, throttled (~1/min), pruned, and written via atomic replace so the file is
-//! never half-written. It is lock-free: the atomic rename prevents corruption, and because
-//! the throttle is checked against the shared file, concurrent double-writes are rare and a
-//! dropped sample is harmless. The throttle is deliberately global (keyed on the last entry
-//! regardless of session): concurrent sessions share the 1/min slot, which bounds write
-//! volume; the day-spend aggregate tolerates the resulting per-session gaps because its
-//! unknown-baseline path undercounts rather than guesses.
+//! Best-effort, throttled (~1/min per session), pruned, and written via atomic replace so
+//! the file is never half-written. It is lock-free: the atomic rename prevents corruption.
+//! The throttle is keyed per session, not shared, so one session's slot can never be won by
+//! another's — a session rendering on a clean cadence used to be able to take the one global
+//! slot on nearly every tick, starving a busier peer's writes for as long as it kept
+//! rendering. Starved meant invisible: every *other* pane's day total reads a session's
+//! last-written cost, however old, so an indefinitely-starved session could sit tens of
+//! minutes stale in every other pane while its own live figure kept climbing. Keying per
+//! session bounds that staleness to one throttle interval, the same guarantee the day-spend
+//! aggregate's undercount-rather-than-guess bias was already built to tolerate.
 //!
 //! For subscription samples the on-disk schema matches the original Python tool's, so an
 //! existing `usage-history.json` carries over unchanged. API-key samples add the
@@ -30,14 +33,17 @@ use serde_json::Value;
 
 use crate::json::{f64_at, get_pct, get_reset, nested, payload_mode, Mode};
 
-pub const SAMPLE_INTERVAL: i64 = 60; // seconds; min gap between logged samples (global)
+pub const SAMPLE_INTERVAL: i64 = 60; // seconds; min gap between a session's own logged samples
 
 // Subscription-only histories keep the original cap (~4h at the 1/min throttle — well past
 // the 2h burn-rate windows). Once API-key samples exist the cap grows so the "spent today"
-// aggregate can see a full local day (~25h ≈ 200 KB at ~140 B/sample); subscription-only
-// users never pay that read/parse cost.
+// aggregate can see a full local day. The throttle is per session, so write volume scales
+// with how many sessions are concurrently active rather than a fixed 1/min: sized for up to
+// 8 sessions spending continuously across the full 26h lookback (8 * 26h at 1/min ≈ 12,480,
+// rounded up), which still keeps the file (~1.8 MB at ~146 B/sample) well under
+// `READ_CAP_BYTES`. Subscription-only users never pay that read/parse cost.
 pub const MAX_ENTRIES: usize = 250;
-pub const MAX_ENTRIES_API: usize = 1500;
+pub const MAX_ENTRIES_API: usize = 12_500;
 pub const MAX_AGE_SECS: i64 = 26 * 3600; // drop samples older than any consumer's lookback
 pub const RATE_WINDOW_MIN: f64 = 120.0; // trailing window for the inline burn rate
 
@@ -262,19 +268,6 @@ impl SubSessions {
         tr.windows.iter().copied().filter(|&w| w <= t).max()
     }
 
-    /// `(time, was_subscription)` for this session's most recent sample.
-    pub fn last_sample(&self, key: &str) -> Option<(i64, bool)> {
-        let tr = self.0.get(key)?;
-        let w = tr.windows.iter().copied().max();
-        let c = tr.costs.iter().map(|(t, _)| *t).max();
-        match (w, c) {
-            (Some(w), Some(c)) => Some(if w >= c { (w, true) } else { (c, false) }),
-            (Some(w), None) => Some((w, true)),
-            (None, Some(c)) => Some((c, false)),
-            (None, None) => None,
-        }
-    }
-
     /// Samples that ordinary retention must not evict, as `(session, time)`: for every
     /// session that has gone quiet, its newest windowed sample — the anchor
     /// [`hold`](Self::hold) reasons from — *and* the newest window-less one after it.
@@ -398,56 +391,26 @@ pub fn log_sample(dir: &Path, input: &Value, now: i64) {
             .as_ref()
             .is_some_and(|k| subs.hold(k, usd, now).is_some());
 
-    // A sample that records a session *changing* billing shape is exempt from the shared
-    // throttle slot. The throttle is global, and with several sessions rendering on the same
-    // timer one can hold the slot indefinitely — which would be a lost data point for any
-    // other sample, but here loses the only evidence a phase happened at all. Both
-    // directions matter: without the windowed sample a subscription phase is invisible and
-    // its shadow climb gets differenced into the day total; without the first probe a real
-    // switch is never provable and the session stays on the waiting line for good. Bounded
-    // to one extra write per minute per session, so a payload flapping between the two
-    // shapes cannot outrun the retention cap.
-    let changes_shape =
-        sid.as_ref()
-            .and_then(|k| subs.last_sample(k))
-            .is_some_and(|(t, was_sub)| {
-                was_sub != (mode == Mode::Subscription) && t <= now.saturating_sub(SAMPLE_INTERVAL)
-            });
-
-    // Every *later* probe from a held session needs the same exemption, for the same reason
-    // one step on. `changes_shape` only ever fires once — the first window-less sample after
-    // the windows stop — but the hold lifts on the counter being seen to *move*, which takes
-    // at least two observations spanning SUB_HOLD_SECS. Those later probes are not a shape
-    // change, so under the global slot a busier session can take every minute and the
-    // switched one is never observed moving: the hold then never lifts at all, rather than
-    // lifting after SUB_HOLD_SECS, and real API-key spend stays invisible for the life of
-    // the session. Bounded exactly as `changes_shape` is — one extra write per minute per
-    // session — and gated on the counter having climbed, so a frozen resume transient still
-    // cannot churn the retention cap.
-    //
-    // "Climbed", not merely "differs", so that this agrees with what [`SubSessions::hold`]
-    // will actually accept as proof: it releases on `u > first_move`, so a slot spent on a
-    // counter that went *down* buys evidence the release can never use. Cumulative counters
-    // do not fall, and a payload where one appears to is a clock step rather than a refund —
-    // which is exactly the case worth spending no slot on. The gate overlaps the
-    // frozen-counter return below and is deliberately kept: it states the exemption's bound
-    // where the exemption is granted, rather than leaving it to hold for only as long as a
-    // later guard stays put.
-    let hold_probe = held
-        && sid.as_ref().is_some_and(|k| {
-            usd.is_some_and(|u| subs.last_cost(k).is_none_or(|prev| u > prev))
-                && subs
-                    .last_sample(k)
-                    .is_none_or(|(t, _)| t <= now.saturating_sub(SAMPLE_INTERVAL))
-        });
-
-    if !changes_shape && !hold_probe {
-        if let Some(last) = hist.last() {
-            // Overflow-safe (stored t is untrusted): equivalent to `now - last.t < INTERVAL`.
-            if last.t > now.saturating_sub(SAMPLE_INTERVAL) {
-                return; // too soon since the last sample
-            }
-        }
+    // The slot is per session: this sample is throttled only against *this session's* own
+    // most recent entry, by time rather than list position (a clock step can leave the file
+    // out of order, so the max, not `hist.last()`, is the true most-recent write). A sample
+    // with no session id has nothing of its own to key on, so it falls back to the shared
+    // slot — the one case where "throttled against everyone" is still the right call, since
+    // otherwise every sid-less sample would go through unthrottled.
+    let last_own = hist
+        .iter()
+        .filter(|s| session_key(s.sid.as_deref()) == sid)
+        .map(|s| s.t)
+        .max();
+    let too_soon = match (&sid, last_own) {
+        (Some(_), Some(t)) => t > now.saturating_sub(SAMPLE_INTERVAL),
+        (None, _) => hist
+            .last()
+            .is_some_and(|last| last.t > now.saturating_sub(SAMPLE_INTERVAL)),
+        (Some(_), None) => false,
+    };
+    if too_soon {
+        return;
     }
 
     // Until that proof lands the sample is still written, just demoted to a window-less
@@ -635,6 +598,48 @@ mod tests {
         let h = read_history(&d.0);
         assert_eq!(h.len(), 1, "stale samples age out");
         assert_eq!(h[0].usd, Some(3.0));
+    }
+
+    #[test]
+    fn a_busy_sessions_renders_never_starve_an_unrelated_peers_writes() {
+        // A session rendering every 20s must not be able to keep an unrelated session from
+        // ever reaching its own 60s slot. A shared clock would allow exactly that: the busy
+        // session's frequent writes re-arm a single "last write" timestamp faster than the
+        // quiet session's own 90s spacing, so the quiet session — genuinely spending money on
+        // its own schedule — would never see a sample land at all.
+        let d = TempDir::new("busy-peer");
+        let mut t = 0;
+        while t <= 600 {
+            log_sample(&d.0, &payload("busy-session", 1.0, false), t);
+            t += 20;
+        }
+        // 12 chars exactly, like "busy-session" above — `session_key` truncates past that,
+        // and a mismatched comparison below would pass for the wrong reason.
+        log_sample(&d.0, &payload("quiet-sess-1", 9.0, false), 5);
+        log_sample(&d.0, &payload("quiet-sess-1", 9.5, false), 95); // 90s later: its own slot
+        log_sample(&d.0, &payload("quiet-sess-1", 10.0, false), 185); // and again
+        let quiet = read_history(&d.0)
+            .into_iter()
+            .filter(|s| s.sid.as_deref() == Some("quiet-sess-1"))
+            .count();
+        assert_eq!(
+            quiet, 3,
+            "the quiet session's own cadence must land regardless of the busy peer"
+        );
+    }
+
+    #[test]
+    fn a_sample_with_no_session_id_falls_back_to_the_shared_slot() {
+        // Nothing of its own to key a per-session throttle on, so this is the one shape that
+        // still has to share a single slot — otherwise every sid-less sample would land
+        // unthrottled.
+        let d = TempDir::new("no-sid");
+        let no_sid = |usd: f64| serde_json::json!({"cost": {"total_cost_usd": usd}});
+        log_sample(&d.0, &no_sid(1.0), 1000);
+        log_sample(&d.0, &no_sid(2.0), 1030); // 30s later: throttled away
+        assert_eq!(read_history(&d.0).len(), 1);
+        log_sample(&d.0, &no_sid(2.0), 1090); // 90s later: logged
+        assert_eq!(read_history(&d.0).len(), 2);
     }
 
     #[test]
@@ -838,16 +843,16 @@ mod tests {
     }
 
     #[test]
-    fn a_change_of_billing_shape_is_never_lost_to_the_shared_throttle() {
-        // The throttle is global, so a busy peer session can hold the slot indefinitely.
-        // Losing an ordinary sample to that is a lost data point; losing the one that marks
-        // a phase boundary loses the only evidence the phase happened.
+    fn a_change_of_billing_shape_lands_on_its_own_session_cadence() {
+        // The throttle is keyed per session, so a busy peer can never make this session wait
+        // on its slot — and a phase boundary is exactly the sample that must never be lost to
+        // such a wait, since losing it loses the only evidence the phase happened.
         let d = TempDir::new("shape");
         let sid = "shifter-1234";
         let peer = |t| log_sample(&d.0, &payload("peer-session", 1.0, true), t);
         log_sample(&d.0, &payload(sid, 5.0, true), 0);
-        peer(1000); // peer takes the slot…
-        log_sample(&d.0, &payload(sid, 5.0, false), 1030); // …but the switch still lands
+        peer(1000); // a busy peer, rendering on its own cadence…
+        log_sample(&d.0, &payload(sid, 5.0, false), 1030); // …never blocks this session's switch
         let h = read_history(&d.0);
         assert_eq!(h.len(), 3);
         assert!(
@@ -855,7 +860,8 @@ mod tests {
             "the probe was written"
         );
 
-        // And back again: the windowed sample that ends the quiet period also lands.
+        // And back again: the windowed sample that ends the quiet period also lands, despite
+        // the peer having just written moments before.
         peer(1100);
         log_sample(&d.0, &payload(sid, 5.5, true), 1130);
         let h = read_history(&d.0);
@@ -864,21 +870,24 @@ mod tests {
             "the phase boundary was written"
         );
 
-        // But an unchanged shape still waits its turn, so the exemption can't be a
-        // back door around the throttle.
-        peer(1200);
-        log_sample(&d.0, &payload(sid, 6.0, true), 1230);
-        assert_eq!(read_history(&d.0).len(), 6);
+        // But this session's own slot still throttles it: a second sample of its own inside
+        // the interval is dropped.
+        log_sample(&d.0, &payload(sid, 6.0, true), 1150); // only 20s after its own last write
+        assert_eq!(
+            read_history(&d.0).len(),
+            5,
+            "too soon since this session's own last sample"
+        );
     }
 
     #[test]
-    fn a_held_sessions_later_probes_are_never_lost_to_the_shared_throttle() {
-        // `changes_shape` exempts only the *first* window-less sample. The hold lifts on the
-        // counter being seen to move, which needs a second observation SUB_HOLD_SECS after
-        // the first movement — and that one is not a shape change. Under the global slot
-        // alone a busy peer takes every minute, the movement is never observed, and the
-        // switch is never proven: the hold stops being a SUB_HOLD_SECS wait and becomes
-        // permanent, hiding real API-key spend for the life of the session.
+    fn a_held_sessions_later_probes_land_on_their_own_cadence() {
+        // The hold lifts on this session's own counter being seen to move, which takes at
+        // least two observations spanning SUB_HOLD_SECS. Per-session throttling means every
+        // one of those probes only has to clear its own session's slot, never a peer's — so a
+        // busy peer rendering throughout the wait must not stop the movement from being
+        // recorded, or the hold would never lift and real API-key spend would stay invisible
+        // for the session's life.
         let d = TempDir::new("holdprobe");
         let sid = "switcher-abc";
         let peer = |t| log_sample(&d.0, &payload("peer-session", 1.0, true), t);
@@ -888,31 +897,16 @@ mod tests {
         log_sample(&d.0, &payload(sid, 5.0, false), 1030); // first probe: the shape change
         assert_eq!(read_history(&d.0).len(), 3);
 
-        // The peer writes one second before every probe, on a 61-second step. That spacing is
-        // the whole load-bearing part of this test: at each probe the session's own last
-        // sample is 61s old, so the exemption's per-session gate is open, while the shared
-        // slot was claimed one second ago, so the ordinary throttle would refuse it. Every
-        // probe below therefore lands only if `hold_probe` grants it a slot.
-        //
-        // The obvious schedule — peer and probe both on a 60s step — does NOT test this, and
-        // silently. A probe that lands sets `hist.last()` to its own timestamp; 60s later the
-        // ordinary throttle admits the next one on the boundary (`last.t > now - INTERVAL` is
-        // false at equality), so the session sustains its own cadence, the peer never gets
-        // the slot back, and the exemption stops mattering after the first write. An
-        // implementation whose exemption worked once and then did nothing passed that
-        // version of this test.
         let mut t = 1090;
         let mut cost = 5.0;
         while t < 1030 + SUB_HOLD_SECS + 600 {
             peer(t);
             cost += 0.25;
-            log_sample(&d.0, &payload(sid, cost, false), t + 1);
+            log_sample(&d.0, &payload(sid, cost, false), t + 1); // 61s after this session's last
             t += 61;
         }
 
-        // The peer stops contending. With the switch now proven the next probe needs no
-        // exemption: it wins the ordinary slot on its own, and is recorded as spend rather
-        // than demoted to a probe.
+        // With the switch now proven, the next probe is recorded as spend rather than demoted.
         cost += 0.25;
         log_sample(&d.0, &payload(sid, cost, false), t + 300);
 
@@ -921,13 +915,9 @@ mod tests {
             .iter()
             .filter(|s| s.sid.as_deref() == Some("switcher-abc"))
             .collect();
-        // Under the schedule above the count is the assertion. Without the exemption this
-        // session lands its anchor and one probe and then nothing (2); with an exemption that
-        // fires and then stops, a handful. Only an exemption granting a slot on every
-        // contended tick reaches dozens.
         assert!(
             mine.len() > 40,
-            "every contended probe landed on the exemption, got {}",
+            "every probe across the wait landed on its own cadence, got {}",
             mine.len()
         );
         assert!(
@@ -947,13 +937,11 @@ mod tests {
     #[test]
     fn a_frozen_hold_probe_still_waits_its_turn() {
         // A resumed session sitting on a frozen counter must write nothing, however long it
-        // idles: that is the churn that would evict the very window samples the hold reasons
-        // from, after which nothing holds the session at all.
-        //
-        // This pins the outcome, not the mechanism, and deliberately so — two guards produce
-        // it (the moved-counter gate on the throttle exemption, and the frozen-counter return
-        // after it), so removing either alone leaves this test green. Asserting on which one
-        // fired would couple the test to an ordering neither guard promises.
+        // idles: repeating the same value would churn ~1/min through the retention cap,
+        // evicting the very window sample the hold reasons from, after which nothing holds
+        // the session at all. The per-session throttle alone would not catch this — 100s have
+        // passed since this session's own last write — so the guard has to be the dedup
+        // against its last recorded cost.
         let d = TempDir::new("frozenprobe");
         let sid = "frozen-sess";
         let peer = |t| log_sample(&d.0, &payload("peer-session", 1.0, true), t);
@@ -964,7 +952,7 @@ mod tests {
         let n = read_history(&d.0).len();
 
         peer(1100);
-        log_sample(&d.0, &payload(sid, 5.0, false), 1130); // same counter: no free slot
+        log_sample(&d.0, &payload(sid, 5.0, false), 1130); // same counter: caught by the dedup
         assert_eq!(
             read_history(&d.0).len(),
             n + 1,
