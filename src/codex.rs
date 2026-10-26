@@ -1,10 +1,10 @@
-//! OpenAI Codex plan usage for `quotaline report --codex`, rebuilt on every run from the
-//! `token_count` events in `$CODEX_HOME/sessions/**/rollout-*.jsonl`. Why logs rather than
-//! stdin: README, `quotaline report --codex`.
+//! OpenAI Codex plan usage, read on every run from the `token_count` events in
+//! `<codex home>/sessions/**/rollout-*.jsonl`. Why logs rather than stdin: README,
+//! `quotaline report --codex`.
 
 use std::ffi::OsString;
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -110,6 +110,139 @@ fn read_rollout(path: &Path, out: &mut Vec<Sample>) {
             out.push(s);
         }
     }
+}
+
+/// Date folders `latest_week` searches: a weekly window plus a day for the timezone the
+/// folders are named in. A session resumed into a rollout older than these is not seen.
+const RECENT_DAY_DIRS: usize = 8;
+/// Rollouts `latest_week` opens at most, newest first.
+const MAX_ROLLOUTS: usize = 16;
+/// How far back `latest_week` reads a rollout at a time, from its end.
+const TAIL_BYTES: u64 = 256 * 1024;
+/// Most bytes `latest_week` reads per call, across all rollouts.
+const READ_BUDGET: u64 = 16 * TAIL_BYTES;
+
+/// A weekly-window reading and the time of the event that carried it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WeekReading {
+    pub pct: f64,
+    pub reset: f64,
+    pub at: f64,
+}
+
+/// The weekly reading with the newest event time in the rollouts of the newest
+/// `RECENT_DAY_DIRS` date folders (`sessions/YYYY/MM/DD`), reading each of at most
+/// `MAX_ROLLOUTS` files back from its end to its newest usage event, `READ_BUDGET` bytes in
+/// all. `None` when nothing it read recorded usage, or the newest rollout that did has no
+/// weekly window (an API-key or non-ChatGPT Codex).
+pub fn latest_week(sessions: &Path) -> Option<WeekReading> {
+    let mut files: Vec<(f64, PathBuf)> = Vec::new();
+    for day in recent_day_dirs(sessions) {
+        let mut found = Vec::new();
+        collect_rollouts(&day, f64::NEG_INFINITY, &mut found);
+        for path in found {
+            let mtime = fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map_or(0.0, |d| d.as_secs_f64());
+            files.push((mtime, path));
+        }
+    }
+    files.sort_by(|a, b| b.0.total_cmp(&a.0));
+
+    let mut best: Option<WeekReading> = None;
+    let mut budget = READ_BUDGET;
+    for (mtime, path) in files.iter().take(MAX_ROLLOUTS) {
+        // appends bump mtime, so a file older than the best event holds nothing newer
+        if budget == 0 || best.is_some_and(|b| *mtime < b.at) {
+            break;
+        }
+        let Some((recorded_usage, reading)) = newest_usage(path, &mut budget) else {
+            continue;
+        };
+        if !recorded_usage {
+            continue;
+        }
+        match (best, reading) {
+            (None, None) => return None,
+            (Some(b), Some(r)) if r.at <= b.at => {}
+            (_, Some(r)) => best = Some(r),
+            (Some(_), None) => {}
+        }
+    }
+    best
+}
+
+fn recent_day_dirs(sessions: &Path) -> Vec<PathBuf> {
+    let mut days = Vec::new();
+    for year in subdirs_newest_first(sessions) {
+        for month in subdirs_newest_first(&year) {
+            for day in subdirs_newest_first(&month) {
+                days.push(day);
+                if days.len() == RECENT_DAY_DIRS {
+                    return days;
+                }
+            }
+        }
+    }
+    days
+}
+
+/// Child directories in descending name order, which is newest first for zero-padded dates.
+fn subdirs_newest_first(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut dirs: Vec<PathBuf> = entries
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .map(|e| e.path())
+        .collect();
+    dirs.sort_unstable_by(|a, b| b.file_name().cmp(&a.file_name()));
+    dirs
+}
+
+/// Reads a rollout back from its end, `TAIL_BYTES` at a time charged to `budget`, until what
+/// it has read holds a usage event: then `true` and the last weekly reading in it, else
+/// `false` once the file or the budget runs out. `None` when the file can't be read.
+fn newest_usage(path: &Path, budget: &mut u64) -> Option<(bool, Option<WeekReading>)> {
+    let mut file = fs::File::open(path).ok()?;
+    let mut start = file.metadata().ok()?.len();
+    let mut read: Vec<u8> = Vec::new();
+    while start > 0 && *budget > 0 {
+        let step = TAIL_BYTES.min(start).min(*budget);
+        start -= step;
+        *budget -= step;
+        file.seek(SeekFrom::Start(start)).ok()?;
+        let mut chunk = vec![0; step as usize];
+        file.read_exact(&mut chunk).ok()?;
+        chunk.extend_from_slice(&read);
+        read = chunk;
+
+        let mut events = usage_events(&read).peekable();
+        if events.peek().is_some() {
+            let reading = events.find_map(|s| {
+                Some(WeekReading {
+                    pct: s.d7?,
+                    reset: s.d7r?,
+                    at: s.t as f64,
+                })
+            });
+            return Some((true, reading));
+        }
+    }
+    Some((false, None))
+}
+
+/// The `token_count` events in `bytes`, last first.
+fn usage_events(bytes: &[u8]) -> impl Iterator<Item = Sample> + '_ {
+    bytes
+        .split(|&b| b == b'\n')
+        .rev()
+        .filter_map(|line| std::str::from_utf8(line).ok())
+        .filter(|line| line.contains("\"token_count\""))
+        .filter_map(parse_event)
 }
 
 fn parse_event(line: &str) -> Option<Sample> {
@@ -599,5 +732,294 @@ mod tests {
         let s = load(&d.0, 0.0);
         assert_eq!(s.last().unwrap().d7, None);
         assert_eq!(analyze(&s, Win::SevenDay, 7200.0, 2100.0).unwrap().cur, 4.0);
+    }
+
+    fn touch_at(path: &Path, secs_ago: u64) {
+        File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(secs_ago))
+            .unwrap();
+    }
+
+    fn pct_reset(sessions: &Path) -> Option<(f64, f64)> {
+        latest_week(sessions).map(|r| (r.pct, r.reset))
+    }
+
+    fn unix_now() -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+    }
+
+    #[test]
+    fn latest_week_reads_the_newest_rollouts_last_reading() {
+        let d = TempDir::new("latest");
+        let older = write(
+            &d.0,
+            "2026/10/25/rollout-a.jsonl",
+            &[event(1000, 9.0, 9e5, 1, 1)],
+        );
+        let newer = write(
+            &d.0,
+            "2026/10/26/rollout-b.jsonl",
+            &[event(2000, 4.0, 8e5, 1, 1), event(2100, 5.0, 8e5, 2, 1)],
+        );
+        touch_at(&older, 600);
+        touch_at(&newer, 60);
+        assert_eq!(pct_reset(&d.0), Some((5.0, 8e5)));
+    }
+
+    #[test]
+    fn a_newest_rollout_that_recorded_nothing_defers_to_the_next() {
+        let d = TempDir::new("fresh");
+        let older = write(
+            &d.0,
+            "2026/10/26/rollout-a.jsonl",
+            &[event(2000, 5.0, 8e5, 1, 1)],
+        );
+        let fresh = write(&d.0, "2026/10/26/rollout-b.jsonl", &["{}".into()]);
+        touch_at(&older, 60);
+        touch_at(&fresh, 0);
+        assert_eq!(pct_reset(&d.0), Some((5.0, 8e5)));
+    }
+
+    #[test]
+    fn the_newest_event_wins_over_the_newest_file() {
+        let d = TempDir::new("newest-event");
+        let now = unix_now();
+        let transcript = r#"{"type":"response_item","payload":{"type":"message"}}"#;
+        let old_window = write(
+            &d.0,
+            "2026/10/26/rollout-a.jsonl",
+            &[event(now - 600, 83.0, 9e9, 1, 1), transcript.into()],
+        );
+        let new_window = write(
+            &d.0,
+            "2026/10/26/rollout-b.jsonl",
+            &[event(now - 300, 1.0, 9.5e9, 1, 1)],
+        );
+        touch_at(&old_window, 60);
+        touch_at(&new_window, 300);
+        assert_eq!(pct_reset(&d.0), Some((1.0, 9.5e9)));
+    }
+
+    #[test]
+    fn a_codex_without_weekly_windows_stops_at_its_newest_rollout() {
+        let d = TempDir::new("no-window");
+        let unwindowed = serde_json::json!({
+            "timestamp": ts(2000), "type": "event_msg",
+            "payload": {"type": "token_count",
+                "info": {"total_token_usage": {"input_tokens": 5, "output_tokens": 1}},
+                "rate_limits": null}
+        });
+        let older = write(
+            &d.0,
+            "2026/10/25/rollout-a.jsonl",
+            &[event(1000, 9.0, 9e5, 1, 1)],
+        );
+        let newest = write(
+            &d.0,
+            "2026/10/26/rollout-b.jsonl",
+            &[unwindowed.to_string()],
+        );
+        touch_at(&older, 600);
+        touch_at(&newest, 60);
+        assert_eq!(latest_week(&d.0), None);
+    }
+
+    #[test]
+    fn latest_week_looks_only_at_the_newest_date_folders() {
+        let d = TempDir::new("folders");
+        for day in 1..=RECENT_DAY_DIRS {
+            write(
+                &d.0,
+                &format!("2026/10/{:02}/rollout-{day}.jsonl", day + 10),
+                &[event(1000, 1.0, 9e5, 1, 1)],
+            );
+        }
+        // one folder older than the window, holding the most recently modified file
+        let stale = write(
+            &d.0,
+            "2026/09/30/rollout-old.jsonl",
+            &[event(1000, 50.0, 9e5, 1, 1)],
+        );
+        touch_at(&stale, 0);
+        assert_eq!(pct_reset(&d.0), Some((1.0, 9e5)));
+    }
+
+    #[test]
+    fn the_window_reaches_exactly_the_eighth_newest_folder() {
+        let d = TempDir::new("eighth");
+        write(
+            &d.0,
+            "2026/10/01/rollout-x.jsonl",
+            &[event(1000, 3.0, 9e5, 1, 1)],
+        );
+        for day in 2..=RECENT_DAY_DIRS {
+            fs::create_dir_all(d.0.join(format!("2026/10/{day:02}"))).unwrap();
+        }
+        assert_eq!(pct_reset(&d.0), Some((3.0, 9e5)));
+        fs::create_dir_all(d.0.join("2026/10/20")).unwrap();
+        assert_eq!(pct_reset(&d.0), None);
+    }
+
+    #[test]
+    fn the_window_crosses_a_year_boundary_newest_first() {
+        let d = TempDir::new("year");
+        for rel in [
+            "2027/01/01",
+            "2027/01/02",
+            "2027/01/03",
+            "2026/12/27",
+            "2026/12/28",
+            "2026/12/29",
+            "2026/12/30",
+            "2026/12/31",
+        ] {
+            write(
+                &d.0,
+                &format!("{rel}/rollout-w.jsonl"),
+                &[event(1000, 1.0, 9e5, 1, 1)],
+            );
+        }
+        let stale = write(
+            &d.0,
+            "2026/12/26/rollout-old.jsonl",
+            &[event(1000, 50.0, 9e5, 1, 1)],
+        );
+        touch_at(&stale, 0);
+        assert_eq!(pct_reset(&d.0), Some((1.0, 9e5)));
+    }
+
+    #[test]
+    fn a_long_running_rollout_in_an_older_folder_still_counts() {
+        let d = TempDir::new("long-running");
+        let long = write(
+            &d.0,
+            "2026/10/24/rollout-long.jsonl",
+            &[event(3000, 12.0, 9e5, 1, 1)],
+        );
+        let short = write(
+            &d.0,
+            "2026/10/26/rollout-short.jsonl",
+            &[event(1000, 3.0, 9e5, 1, 1)],
+        );
+        touch_at(&short, 3600);
+        touch_at(&long, 0);
+        assert_eq!(pct_reset(&d.0), Some((12.0, 9e5)));
+    }
+
+    #[test]
+    fn a_trailing_event_without_a_weekly_window_falls_back_within_the_file() {
+        let d = TempDir::new("trailing-null");
+        let older = write(
+            &d.0,
+            "2026/10/25/rollout-a.jsonl",
+            &[event(1000, 9.0, 9e5, 1, 1)],
+        );
+        let unwindowed = r#"{"timestamp":"2026-10-26T00:00:00.000Z","type":"event_msg","payload":{"type":"token_count","info":null,"rate_limits":null}}"#;
+        let newer = write(
+            &d.0,
+            "2026/10/26/rollout-b.jsonl",
+            &[event(2000, 5.0, 8e5, 1, 1), unwindowed.into()],
+        );
+        touch_at(&older, 600);
+        touch_at(&newer, 60);
+        assert_eq!(pct_reset(&d.0), Some((5.0, 8e5)));
+    }
+
+    #[test]
+    fn a_half_written_last_line_falls_back_to_the_complete_one() {
+        let d = TempDir::new("partial");
+        let full = event(2000, 5.0, 8e5, 1, 1);
+        let partial = full[..full.len() / 2].to_string();
+        assert!(partial.contains("\"token_count\""));
+        let path = d.0.join("2026/10/26/rollout-a.jsonl");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, format!("{full}\n{partial}")).unwrap();
+        assert_eq!(pct_reset(&d.0), Some((5.0, 8e5)));
+    }
+
+    #[test]
+    fn a_usage_event_under_a_long_tool_output_is_still_found() {
+        let d = TempDir::new("buried");
+        write(
+            &d.0,
+            "2026/10/26/rollout-a.jsonl",
+            &buried(event(2000, 6.0, 9e5, 1, 1), TAIL_BYTES + 64 * 1024),
+        );
+        assert_eq!(pct_reset(&d.0), Some((6.0, 9e5)));
+    }
+
+    #[test]
+    fn a_live_rollout_mid_tool_output_still_beats_an_older_window() {
+        let d = TempDir::new("buried-live");
+        let now = unix_now();
+        let transcript = r#"{"type":"response_item","payload":{"type":"message"}}"#;
+        let old_window = write(
+            &d.0,
+            "2026/10/26/rollout-a.jsonl",
+            &[event(now - 600, 83.0, 9e9, 1, 1), transcript.into()],
+        );
+        let live = write(
+            &d.0,
+            "2026/10/26/rollout-b.jsonl",
+            &buried(event(now - 300, 1.0, 9.5e9, 1, 1), TAIL_BYTES + 64 * 1024),
+        );
+        touch_at(&old_window, 60);
+        touch_at(&live, 10);
+        assert_eq!(pct_reset(&d.0), Some((1.0, 9.5e9)));
+    }
+
+    #[test]
+    fn reading_stops_at_the_budget_rather_than_falling_back_to_an_older_rollout() {
+        let d = TempDir::new("budget");
+        let too_deep = write(
+            &d.0,
+            "2026/10/26/rollout-a.jsonl",
+            &buried(event(2000, 6.0, 9e5, 1, 1), READ_BUDGET + 64 * 1024),
+        );
+        let older = write(
+            &d.0,
+            "2026/10/25/rollout-b.jsonl",
+            &[event(1000, 4.0, 9e5, 1, 1)],
+        );
+        touch_at(&older, 600);
+        touch_at(&too_deep, 0);
+        assert_eq!(pct_reset(&d.0), None);
+    }
+
+    #[test]
+    fn rollouts_are_read_newest_modified_first() {
+        let d = TempDir::new("sorted");
+        for n in 0..MAX_ROLLOUTS {
+            let f = write(
+                &d.0,
+                &format!("2026/10/26/rollout-{n:02}.jsonl"),
+                &[event(1000, 3.0, 9e5, 1, 1)],
+            );
+            touch_at(&f, 3600);
+        }
+        let long = write(
+            &d.0,
+            "2026/10/24/rollout-long.jsonl",
+            &[event(3000, 12.0, 9e5, 1, 1)],
+        );
+        touch_at(&long, 0);
+        assert_eq!(pct_reset(&d.0), Some((12.0, 9e5)));
+    }
+
+    /// `last_event` followed by at least `bytes` of transcript with no usage event in it.
+    fn buried(last_event: String, bytes: u64) -> Vec<String> {
+        let padding = format!(
+            "{{\"type\":\"response_item\",\"x\":\"{}\"}}",
+            "a".repeat(1024)
+        );
+        let mut lines = vec![last_event];
+        lines.extend(std::iter::repeat_n(padding, (bytes / 1024) as usize + 1));
+        lines
     }
 }

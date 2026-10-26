@@ -168,11 +168,13 @@ fn codex_header_stats(events: usize, span_secs: i64, since_last_secs: i64) -> St
 }
 
 /// `quotaline report --codex`: the weekly window and token burn rebuilt from Codex's own
-/// rollout logs. No $ section: plan usage is not metered in dollars.
-pub fn run_codex(window_min: f64) -> i32 {
+/// rollout logs, under `codex_home` if given, else `CODEX_HOME` or `~/.codex`. No $ section:
+/// plan usage is not metered in dollars.
+pub fn run_codex(window_min: f64, codex_home: Option<std::path::PathBuf>) -> i32 {
     let now = crate::now_secs();
     let window_sec = window_min * 60.0;
-    let Some(home) = crate::codex::codex_home() else {
+    let explicit = codex_home.is_some();
+    let Some(home) = codex_home.or_else(crate::codex::codex_home) else {
         eprintln!("error: can't locate Codex's state: set CODEX_HOME or HOME.");
         return 1;
     };
@@ -186,6 +188,13 @@ pub fn run_codex(window_min: f64) -> i32 {
         }
     };
     if missing {
+        if explicit {
+            eprintln!(
+                "error: --codex-home has no sessions directory: {}",
+                sessions.display()
+            );
+            return 1;
+        }
         if std::env::var_os("CODEX_HOME").is_some_and(|v| !v.is_empty()) {
             eprintln!(
                 "error: CODEX_HOME has no sessions directory: {}",

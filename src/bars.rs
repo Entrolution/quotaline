@@ -9,6 +9,10 @@ const EIGHTHS: [&str; 8] = ["", "▏", "▎", "▍", "▌", "▋", "▊", "▉"]
 
 /// The inner bar (no frame): `width` cells, coloured by `pct`. `None` → dim empty track.
 fn inner(pct: Option<f64>, width: usize) -> String {
+    inner_in(pct, width, color_for(pct))
+}
+
+fn inner_in(pct: Option<f64>, width: usize, colour: &str) -> String {
     let p = match pct {
         Some(p) => p.clamp(0.0, 100.0),
         None => return format!("{GRAY}{}{RESET}", " ".repeat(width)),
@@ -28,12 +32,17 @@ fn inner(pct: Option<f64>, width: usize) -> String {
         used += 1;
     }
     let empty = width.saturating_sub(used);
-    format!("{}{fill}{RESET}{}", color_for(Some(p)), " ".repeat(empty))
+    format!("{colour}{fill}{RESET}{}", " ".repeat(empty))
 }
 
 /// Inner bar wrapped in the slim dim frame.
 pub fn framed(pct: Option<f64>, width: usize) -> String {
     format!("{DIM}▕{RESET}{}{DIM}▏{RESET}", inner(pct, width))
+}
+
+/// [`framed`] with the fill in grey whatever its level, for a reading that may be out of date.
+pub fn framed_grey(pct: Option<f64>, width: usize) -> String {
+    format!("{DIM}▕{RESET}{}{DIM}▏{RESET}", inner_in(pct, width, GRAY))
 }
 
 #[cfg(test)]
