@@ -2,14 +2,15 @@
 //! on API-key (pay-as-you-go) billing, which has no limits — real dollar spend.
 //!
 //!   quotaline                          render the status line (reads JSON on stdin)
+//!   quotaline --codex-home DIR         …plus Codex's weekly bar, from DIR's rollout logs
 //!   quotaline report [--window N]      on-demand burn-rate + headroom report
 //!   quotaline report --codex           burn rate for OpenAI Codex plan usage
 //!   quotaline install [--refresh N]    wire into ~/.claude/settings.json
 //!   quotaline uninstall                remove it again
 //!
 //! Status-line data comes only from the JSON Claude Code pipes on stdin —
-//! no network, no auth, no Terms-of-Service surface. The Codex report reads the
-//! rollout logs Codex writes under `$CODEX_HOME`; it too makes no network call.
+//! no network, no auth, no Terms-of-Service surface — unless `--codex-home` opts in
+//! to reading Codex's rollout logs, as the Codex report does. Neither makes a network call.
 
 use std::io::{IsTerminal, Read, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -32,9 +33,12 @@ quotaline — Claude Code usage status line
 
 USAGE:
   quotaline                        render the status line (reads Claude Code's JSON on stdin)
+  quotaline --codex-home DIR       …plus a cx bar for the Codex plan whose state is in DIR
   quotaline report [--window N]    on-demand burn-rate + headroom report (N minutes)
-  quotaline report --codex         burn rate for OpenAI Codex plan usage (reads $CODEX_HOME)
+  quotaline report --codex         burn rate for OpenAI Codex plan usage
+                                   ([--codex-home DIR], else $CODEX_HOME, else ~/.codex)
   quotaline install [--refresh N]  wire into ~/.claude/settings.json (refresh seconds; default 10)
+                                   [--codex-home DIR] adds the cx bar; a reinstall keeps it
   quotaline uninstall              remove the statusLine block
 ";
 
@@ -49,7 +53,8 @@ pub fn now_secs() -> f64 {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
-        None => run_statusline(),
+        None => run_statusline(None),
+        Some("--codex-home") => run_statusline(codex_home_flag(&args)),
         Some("report") => {
             end_quietly_on_closed_pipe();
             // A non-finite or non-positive window would silently distort every rate fit;
@@ -58,13 +63,14 @@ fn main() {
                 .filter(|w| w.is_finite() && *w > 0.0)
                 .unwrap_or(report::DEFAULT_WINDOW_MIN);
             if args.iter().any(|a| a == "--codex") {
-                std::process::exit(report::run_codex(window));
+                std::process::exit(report::run_codex(window, codex_home_flag(&args)));
             }
             std::process::exit(report::run(window));
         }
         Some("install") => {
             let refresh = flag_u64(&args, "--refresh").unwrap_or(10);
-            std::process::exit(install::install(refresh));
+            let codex_home = flag_value(&args, "--codex-home").filter(|d| !d.is_empty());
+            std::process::exit(install::install(refresh, codex_home));
         }
         Some("uninstall") => std::process::exit(install::uninstall()),
         Some("-h") | Some("--help") | Some("help") => print!("{USAGE}"),
@@ -108,9 +114,25 @@ fn flag_u64(args: &[String], name: &str) -> Option<u64> {
     flag_value(args, name)?.parse().ok()
 }
 
+/// The `--codex-home DIR` argument, if given and non-empty (an unset `"$CODEX_HOME"`
+/// expands to empty, which must not mean the working directory).
+fn codex_home_flag(args: &[String]) -> Option<std::path::PathBuf> {
+    flag_value(args, "--codex-home")
+        .filter(|d| !d.is_empty())
+        .map(expand_home)
+}
+
+/// `~/…` against the home directory, since a statusLine command need not run in a shell.
+fn expand_home(dir: &str) -> std::path::PathBuf {
+    match (dir.strip_prefix("~/"), history::home_dir()) {
+        (Some(rest), Some(home)) => home.join(rest),
+        _ => std::path::PathBuf::from(dir),
+    }
+}
+
 /// The status-line path: read stdin, render, print, then log a sample. Each stage is wrapped
 /// so a panic can never break the prompt (the analogue of the Python's top-level try/except).
-fn run_statusline() {
+fn run_statusline(codex_home: Option<std::path::PathBuf>) {
     // Invoked interactively with no piped input? Show usage rather than blocking on stdin.
     if std::io::stdin().is_terminal() {
         print!("{USAGE}");
@@ -130,7 +152,8 @@ fn run_statusline() {
     };
     let now = now_secs();
 
-    let out = std::panic::catch_unwind(|| statusline::render(&input, now)).unwrap_or_default();
+    let out = std::panic::catch_unwind(|| statusline::render(&input, now, codex_home.as_deref()))
+        .unwrap_or_default();
     {
         let stdout = std::io::stdout();
         let mut lock = stdout.lock();

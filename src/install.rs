@@ -83,7 +83,21 @@ fn load_object(settings: &Path) -> Result<Value, String> {
     }
 }
 
-pub fn install(refresh: u64) -> i32 {
+/// The statusLine command: the binary, plus `--codex-home` when asked for, or when the
+/// command being replaced already carried it (the install scripts re-run `install` on every
+/// upgrade, which would otherwise drop the opt-in).
+fn statusline_command(exe: &str, codex_home: Option<&str>, existing: Option<&str>) -> String {
+    let base = quote_cmd(exe);
+    if let Some(dir) = codex_home {
+        return format!("{base} --codex-home {}", quote_cmd(dir));
+    }
+    let kept = existing
+        .and_then(|cmd| cmd.split_once(" --codex-home "))
+        .map(|(_, dir)| format!(" --codex-home {dir}"));
+    format!("{base}{}", kept.unwrap_or_default())
+}
+
+pub fn install(refresh: u64, codex_home: Option<&str>) -> i32 {
     let exe = match std::env::current_exe() {
         Ok(p) => p.to_string_lossy().into_owned(),
         Err(e) => {
@@ -116,7 +130,11 @@ pub fn install(refresh: u64) -> i32 {
         let _ = fs::create_dir_all(parent);
     }
 
-    let command = quote_cmd(&exe);
+    let existing = root
+        .pointer("/statusLine/command")
+        .and_then(Value::as_str)
+        .filter(|cmd| cmd.contains("quotaline"));
+    let command = statusline_command(&exe, codex_home, existing);
     let mut block = Map::new();
     block.insert("type".into(), Value::String("command".into()));
     block.insert("command".into(), Value::String(command.clone()));
@@ -183,4 +201,28 @@ pub fn uninstall() -> i32 {
         }
     );
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_reinstall_keeps_the_codex_opt_in() {
+        let exe = "/bin/quotaline";
+        assert_eq!(statusline_command(exe, None, None), "/bin/quotaline");
+        assert_eq!(
+            statusline_command(exe, Some("/c x"), None),
+            "/bin/quotaline --codex-home \"/c x\""
+        );
+        let old = Some("/old/quotaline --codex-home ~/.codex");
+        assert_eq!(
+            statusline_command(exe, None, old),
+            "/bin/quotaline --codex-home ~/.codex"
+        );
+        assert_eq!(
+            statusline_command(exe, Some("/new"), old),
+            "/bin/quotaline --codex-home /new"
+        );
+    }
 }

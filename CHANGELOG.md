@@ -16,6 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   records in `$CODEX_HOME/sessions/**/rollout-*.jsonl`. Codex gets no history file of its
   own, and Claude's history is untouched. The rate reads idle when Codex logged nothing in
   the rate window, rather than projecting an older burst.
+- **An opt-in `cx` bar on the status line for Codex's weekly window**: `quotaline --codex-home
+  DIR` adds its % and reset, read from the newest rollouts in `DIR/sessions` on each render.
+  It turns grey once its newest reading is over 12 hours old, and is absent when Codex has no
+  current weekly window.
 
 ### Fixed
 

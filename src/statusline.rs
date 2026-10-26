@@ -1,10 +1,14 @@
 //! Assembles the status line from the stdin payload: header plus 5h/weekly bars on a
-//! subscription, or header plus a real-$ "spent today" line on API-key billing.
+//! subscription, or header plus a real-$ "spent today" line on API-key billing, and beneath
+//! either a Codex weekly bar when given a Codex home.
+
+use std::path::Path;
 
 use serde_json::Value;
 
-use crate::bars::framed;
+use crate::bars::{framed, framed_grey};
 use crate::burn::{burn_suffix, history_rate, Win};
+use crate::codex::WeekReading;
 use crate::fmt::{color_for, fmt_dur, fmt_tokens, fmt_usd, AMBER, DIM, GRAY, GREEN, RED, RESET};
 use crate::history::{read_history, state_dir, Sample, RATE_WINDOW_MIN};
 use crate::json::{f64_at, get_pct, get_reset, nested, payload_mode, str_at, Mode};
@@ -134,15 +138,28 @@ fn render_line(
     rt: &str,
     suffix_colored: &str,
 ) -> String {
+    line(label, pct, bar_width, rt, suffix_colored, false)
+}
+
+/// [`render_line`], optionally with the bar and % in grey whatever their level.
+fn line(
+    label: &str,
+    pct: Option<f64>,
+    bar_width: usize,
+    rt: &str,
+    suffix_colored: &str,
+    grey: bool,
+) -> String {
     let pctf = match pct {
         Some(p) => format!("{:>2}%", p.round() as i64),
         None => "--%".to_string(),
     };
-    let mut s = format!(
-        "{DIM}{label}{RESET}  {bar} {pc}{pctf}{RESET}  {DIM}{rt}{RESET}",
-        bar = framed(pct, bar_width),
-        pc = color_for(pct),
-    );
+    let (bar, pc) = if grey {
+        (framed_grey(pct, bar_width), GRAY)
+    } else {
+        (framed(pct, bar_width), color_for(pct))
+    };
+    let mut s = format!("{DIM}{label}{RESET}  {bar} {pc}{pctf}{RESET}  {DIM}{rt}{RESET}");
     if !suffix_colored.is_empty() {
         s.push_str("  ");
         s.push_str(suffix_colored);
@@ -160,13 +177,42 @@ fn join_right(rt: &str, suffix_plain: &str) -> String {
 }
 
 /// Render the full status line (no trailing newline). Pure aside from reading the sample
-/// history and env — logging happens after, in main.
-pub fn render(input: &Value, now: f64) -> String {
+/// history, env and, given a `codex_home`, Codex's rollouts — logging happens after, in main.
+pub fn render(input: &Value, now: f64, codex_home: Option<&Path>) -> String {
+    // a fault in a third-party log format must not take the Claude bars down with it
+    let codex = codex_home
+        .and_then(|home| std::panic::catch_unwind(|| codex_week(home, now)).ok())
+        .flatten();
     match payload_mode(input) {
-        Mode::Subscription => render_subscription(input, now),
-        Mode::ApiKey => render_api_key(input, now),
-        Mode::Unknown => limits_na(),
+        Mode::Subscription => render_subscription(input, now, codex),
+        Mode::ApiKey => with_codex(render_api_key(input, now), codex, now),
+        Mode::Unknown => with_codex(limits_na(), codex, now),
     }
+}
+
+/// A `cx` reading older than this is drawn grey: Codex replaces weekly windows early and
+/// only reports the new one at its next request, so an old reading may be a dead window's.
+const CODEX_STALE_SECS: f64 = 12.0 * 3600.0;
+
+/// Codex's current weekly reading under `home`, if it has one. A reading whose reset has
+/// passed belongs to a window that has already rolled over.
+fn codex_week(home: &Path, now: f64) -> Option<WeekReading> {
+    crate::codex::latest_week(&home.join("sessions")).filter(|r| r.reset > now)
+}
+
+fn cx_line(r: &WeekReading, bar_width: usize, now: f64) -> String {
+    let rt = reset_text(Some(r.reset), now);
+    let stale = now - r.at > CODEX_STALE_SECS;
+    line("cx", Some(r.pct), bar_width, &rt, "", stale)
+}
+
+/// Appends the Codex `cx` line under a render that has no weekly bars to align with.
+fn with_codex(rendered: String, codex: Option<WeekReading>, now: f64) -> String {
+    let Some(r) = codex else {
+        return rendered;
+    };
+    let width = bar_width(2, reset_text(Some(r.reset), now).chars().count());
+    format!("{rendered}\n{}", cx_line(&r, width, now))
 }
 
 fn limits_na() -> String {
@@ -199,12 +245,13 @@ fn limits_held(input: &Value, quiet_secs: i64) -> String {
     }
 }
 
-/// Subscription (Pro/Max): the account-wide 5-hour and weekly bars.
-fn render_subscription(input: &Value, now: f64) -> String {
+/// Subscription (Pro/Max): the account-wide 5-hour and weekly bars, and Codex's weekly bar
+/// aligned beneath them when there is one.
+fn render_subscription(input: &Value, now: f64, codex: Option<WeekReading>) -> String {
     // payload_mode guarantees a non-empty rate_limits object here, but that invariant lives
     // in another module — degrade like every other missing-data path rather than trusting it.
     let Some(rl) = nested(input, &["rate_limits"]) else {
-        return limits_na();
+        return with_codex(limits_na(), codex, now);
     };
     let five = rl.get("five_hour").filter(|v| !v.is_null());
     let week = rl.get("seven_day").filter(|v| !v.is_null());
@@ -231,10 +278,12 @@ fn render_subscription(input: &Value, now: f64) -> String {
 
     let rt5 = reset_text(five_reset, now);
     let rt7 = reset_text(week_reset, now);
+    let rtcx = codex.map(|r| reset_text(Some(r.reset), now));
     let max_right = join_right(&rt5, &five_sp)
         .chars()
         .count()
-        .max(join_right(&rt7, &week_sp).chars().count());
+        .max(join_right(&rt7, &week_sp).chars().count())
+        .max(rtcx.as_ref().map_or(0, |rt| rt.chars().count()));
 
     let bar_width = bar_width(2, max_right);
 
@@ -244,6 +293,9 @@ fn render_subscription(input: &Value, now: f64) -> String {
     }
     lines.push(render_line("5h", five_pct, bar_width, &rt5, &five_sc));
     lines.push(render_line("wk", week_pct, bar_width, &rt7, &week_sc));
+    if let Some(r) = codex {
+        lines.push(cx_line(&r, bar_width, now));
+    }
     lines.join("\n")
 }
 
@@ -326,6 +378,36 @@ fn render_api_key_with(input: &Value, now: f64, hist: &[Sample]) -> String {
 mod tests {
     use super::*;
     use crate::history::SUB_HOLD_SECS;
+
+    #[test]
+    fn a_cx_reading_older_than_twelve_hours_is_drawn_grey() {
+        let now = 1_000_000.0;
+        let reading = |age: f64| WeekReading {
+            pct: 7.0,
+            reset: now + 86_400.0,
+            at: now - age,
+        };
+        let fresh = cx_line(&reading(CODEX_STALE_SECS), 20, now);
+        let stale = cx_line(&reading(CODEX_STALE_SECS + 1.0), 20, now);
+        assert!(fresh.contains(&format!("{GREEN} 7%")), "{fresh:?}");
+        assert!(stale.contains(&format!("{GRAY} 7%")), "{stale:?}");
+        assert!(!stale.contains(GREEN), "{stale:?}");
+        let pct_col = |s: &str| {
+            let mut col = 0;
+            let mut in_escape = false;
+            for c in s.chars() {
+                match (in_escape, c) {
+                    (false, '\u{1b}') => in_escape = true,
+                    (true, 'm') => in_escape = false,
+                    (true, _) => {}
+                    (false, '%') => return col,
+                    (false, _) => col += 1,
+                }
+            }
+            col
+        };
+        assert_eq!(pct_col(&stale), pct_col(&fresh), "{stale:?}\n{fresh:?}");
+    }
 
     fn windowed(t: i64, usd: f64) -> Sample {
         Sample {

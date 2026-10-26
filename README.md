@@ -53,6 +53,12 @@ a burn-rate report for OpenAI Codex plan usage (`quotaline report --codex`).
 - `⚠ cap <eta>` — shown **only** when, at the current rate, you'd hit 100% *before* the window
   resets. No warning means you'll reset before you run out.
 
+**A `cx` bar**, if you opt in with `--codex-home` (see
+[`quotaline report --codex`](#quotaline-report---codex--openai-codex)): OpenAI Codex's weekly
+% and reset, read from Codex's own logs, under the weekly bar. It has no burn rate or cap
+warning, turns grey when its newest reading is over 12 hours old, and is absent when Codex
+has no current window.
+
 Before your plan/session produces usage data, the line shows
 `limits n/a (awaiting first API response)`. When the windows *stop* arriving for a session
 that had been reporting them — a resumed session waiting on its first fresh response, or one
@@ -206,6 +212,7 @@ Burn rate for a ChatGPT plan's Codex allowance:
 ```sh
 quotaline report --codex               # last ~2h for the rate
 quotaline report --codex --window 30
+quotaline report --codex --codex-home ~/.codex-work   # a Codex home other than CODEX_HOME's
 ```
 
 ```
@@ -217,7 +224,8 @@ Codex usage — burn rate  (3,412 events over 6d21h, last 4m ago)
   tok  in 18.2M · out 96k over the last 2h   ≈9.1M/hr
 ```
 
-Codex has no status-line hook, so this is the one place quotaline reads logs. Codex records
+Codex has no status-line hook, so here (and for the status line's opt-in `cx` bar) quotaline
+reads Codex's own logs. Codex records
 each response's server-reported `rate_limits` and the thread's running token totals in
 `$CODEX_HOME/sessions/**/rollout-*.jsonl` (default `~/.codex`), and the report rebuilds its
 series from those files on each run. The **%** is therefore still the official account-wide
@@ -228,6 +236,15 @@ dollars. Nothing is written to `~/.claude/quotaline/`.
 Only the weekly window is shown, because it is the only one Codex reports on Pro. Codex has
 been observed starting a fresh weekly window days before the previous one's stated reset,
 so treat "resets in" as an upper bound.
+
+To show Codex's weekly window on the status line, give the statusLine command your Codex
+home: `quotaline install --codex-home ~/.codex` (or wherever `CODEX_HOME` points) writes
+`quotaline --codex-home ~/.codex`, and a later `quotaline install` keeps it. Without the flag
+the status line reads nothing of Codex's. Each render reads back from the end of the newest few
+rollouts in the last 8 date folders, so a session resumed into an older rollout is not seen,
+and a Codex signed in with an API key, which records no weekly window, shows no bar. The bar
+turns grey once its newest reading is over 12 hours old: a weekly window can be replaced
+early, and Codex only reports the new one at its next request.
 
 ## Configuration
 
@@ -242,8 +259,8 @@ Environment overrides:
 - `QUOTALINE_BIN_DIR` — where the install script puts the binary.
 - `QUOTALINE_DAILY_BUDGET` — USD/day; turns the API-key `day` line into a %-of-budget bar
   with a budget-ETA warning (no effect on subscription sessions).
-- `CODEX_HOME` — where `report --codex` looks for Codex's rollouts (default `~/.codex`), the
-  same variable the Codex CLI reads.
+- `CODEX_HOME` — where `report --codex` looks for Codex's rollouts when no `--codex-home` is
+  given (default `~/.codex`), the same variable the Codex CLI reads.
 
 Colour thresholds, bar caps and the sampling/rate windows are compile-time constants at the
 top of the `src` modules — change them and rebuild from source.

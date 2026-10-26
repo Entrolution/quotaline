@@ -1,24 +1,11 @@
 //! `quotaline report --codex` end to end, against a throwaway `CODEX_HOME`.
 
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
-use std::time::{SystemTime, UNIX_EPOCH};
+mod common;
 
-struct TempDir(PathBuf);
-impl TempDir {
-    fn new(tag: &str) -> Self {
-        let p = std::env::temp_dir().join(format!("quotaline-it-{}-{tag}", std::process::id()));
-        let _ = fs::remove_dir_all(&p);
-        fs::create_dir_all(&p).unwrap();
-        TempDir(p)
-    }
-}
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
+use std::path::Path;
+use std::process::{Command, Output};
+
+use common::{event, now, write_rollout, TempDir};
 
 fn report(codex_home: &Path) -> Output {
     Command::new(env!("CARGO_BIN_EXE_quotaline"))
@@ -27,55 +14,6 @@ fn report(codex_home: &Path) -> Output {
         .env("CTT_STATE_DIR", codex_home)
         .output()
         .unwrap()
-}
-
-fn now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64
-}
-
-/// Hinnant, howardhinnant.github.io/date_algorithms.html#civil_from_days
-fn rfc3339(epoch: i64) -> String {
-    let z = epoch.div_euclid(86_400) + 719_468;
-    let secs = epoch.rem_euclid(86_400);
-    let era = z.div_euclid(146_097);
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = yoe + era * 400 + i64::from(m <= 2);
-    format!(
-        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
-        secs / 3600,
-        secs % 3600 / 60,
-        secs % 60
-    )
-}
-
-fn event(t: i64, pct: f64, reset: i64, tin: i64, tout: i64) -> String {
-    serde_json::json!({
-        "timestamp": rfc3339(t),
-        "type": "event_msg",
-        "payload": {
-            "type": "token_count",
-            "info": {"total_token_usage": {"input_tokens": tin, "output_tokens": tout}},
-            "rate_limits": {
-                "primary": {"used_percent": pct, "window_minutes": 10080, "resets_at": reset},
-                "secondary": null
-            }
-        }
-    })
-    .to_string()
-}
-
-fn write_rollout(home: &Path, lines: &[String]) {
-    let dir = home.join("sessions/2026/10/26");
-    fs::create_dir_all(&dir).unwrap();
-    fs::write(dir.join("rollout-a.jsonl"), lines.join("\n") + "\n").unwrap();
 }
 
 #[test]
@@ -129,4 +67,24 @@ fn an_explicit_codex_home_without_sessions_is_an_error() {
     let out = report(&d.0);
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("CODEX_HOME has no sessions directory"));
+}
+
+#[test]
+fn codex_home_flag_overrides_the_environment() {
+    let d = TempDir::new("flag");
+    let now = now();
+    write_rollout(
+        &d.0.join("work"),
+        &[event(now - 60, 4.0, now + 5 * 86_400, 10, 1)],
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_quotaline"))
+        .args(["report", "--codex", "--codex-home"])
+        .arg(d.0.join("work"))
+        .env("CODEX_HOME", d.0.join("elsewhere"))
+        .env("CTT_STATE_DIR", &d.0)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}");
+    assert!(stdout.contains("  4%"), "{stdout}");
 }
