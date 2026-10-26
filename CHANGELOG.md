@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`quotaline report --codex`: the burn-rate report for OpenAI Codex plan usage.** It shows the
+  weekly window's %, %/hr, cap ETA and reset countdown, a raw-tokens-per-1% anchor, and the
+  token burn over the rate window. Codex has no status-line hook, so the series is rebuilt
+  on each run from the server-reported `rate_limits` and running token totals that Codex
+  records in `$CODEX_HOME/sessions/**/rollout-*.jsonl`. Codex gets no history file of its
+  own, and Claude's history is untouched. The rate reads idle when Codex logged nothing in
+  the rate window, rather than projecting an older burst.
+
 ## [1.3.3] - 2026-08-11
 
 ### Fixed

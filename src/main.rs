@@ -3,17 +3,20 @@
 //!
 //!   quotaline                          render the status line (reads JSON on stdin)
 //!   quotaline report [--window N]      on-demand burn-rate + headroom report
+//!   quotaline report --codex           burn rate for OpenAI Codex plan usage
 //!   quotaline install [--refresh N]    wire into ~/.claude/settings.json
 //!   quotaline uninstall                remove it again
 //!
 //! Status-line data comes only from the JSON Claude Code pipes on stdin —
-//! no network, no auth, no Terms-of-Service surface.
+//! no network, no auth, no Terms-of-Service surface. The Codex report reads the
+//! rollout logs Codex writes under `$CODEX_HOME`; it too makes no network call.
 
 use std::io::{IsTerminal, Read, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 mod bars;
 mod burn;
+mod codex;
 mod fmt;
 mod history;
 mod install;
@@ -30,6 +33,7 @@ quotaline — Claude Code usage status line
 USAGE:
   quotaline                        render the status line (reads Claude Code's JSON on stdin)
   quotaline report [--window N]    on-demand burn-rate + headroom report (N minutes)
+  quotaline report --codex         burn rate for OpenAI Codex plan usage (reads $CODEX_HOME)
   quotaline install [--refresh N]  wire into ~/.claude/settings.json (refresh seconds; default 10)
   quotaline uninstall              remove the statusLine block
 ";
@@ -52,6 +56,9 @@ fn main() {
             let window = flag_f64(&args, "--window")
                 .filter(|w| w.is_finite() && *w > 0.0)
                 .unwrap_or(report::DEFAULT_WINDOW_MIN);
+            if args.iter().any(|a| a == "--codex") {
+                std::process::exit(report::run_codex(window));
+            }
             std::process::exit(report::run(window));
         }
         Some("install") => {
