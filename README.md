@@ -10,11 +10,13 @@ A Claude Code **status line** that shows your **official** account-wide usage li
 5-hour and weekly (7-day) windows — with a live burn rate and a warning when you're on track
 to hit a cap before it resets. On **API-key (pay-as-you-go) billing**, where no limits exist,
 it shows your **real dollar spend** instead — this session, today across sessions, and $/hour.
-It reads only the data Claude Code already hands it: no tokens, no API calls, no log scraping.
+The status line reads only the data Claude Code already hands it: no tokens, no API calls, no
+log scraping.
 
 ![quotaline status line — a "model · effort · ctx · mem" header, then 5-hour and weekly usage bars (green/amber/red) with reset times, an inline burn rate, and a red cap warning](assets/demo.svg)
 
-Plus an on-demand report (`quotaline report`) with an approximate **$ headroom** estimate.
+Plus an on-demand report (`quotaline report`) with an approximate **$ headroom** estimate, and
+a burn-rate report for OpenAI Codex plan usage (`quotaline report --codex`).
 
 ## Why quotaline
 
@@ -197,6 +199,36 @@ whether you hit the budget or midnight first:
       budget $50/day — 25% used → rolls over first
 ```
 
+## `quotaline report --codex` — OpenAI Codex
+
+Burn rate for a ChatGPT plan's Codex allowance:
+
+```sh
+quotaline report --codex               # last ~2h for the rate
+quotaline report --codex --window 30
+```
+
+```
+Codex usage — burn rate  (3,412 events over 6d21h, last 4m ago)
+
+  wk  ██░░░░░░░░░░░░   12%  +0.8%/hr   ETA 4d14h   resets in 5d2h @ 9:37am (Mon)  → hits cap first
+      ≈9,400,000 raw-tok/1%
+
+  tok  in 18.2M · out 96k over the last 2h   ≈9.1M/hr
+```
+
+Codex has no status-line hook, so this is the one place quotaline reads logs. Codex records
+each response's server-reported `rate_limits` and the thread's running token totals in
+`$CODEX_HOME/sessions/**/rollout-*.jsonl` (default `~/.codex`), and the report rebuilds its
+series from those files on each run. The **%** is therefore still the official account-wide
+figure, as of Codex's last recorded event; the **token** counts cover only that
+`CODEX_HOME` on this machine. There is no `$` figure, since plan usage is not metered in
+dollars. Nothing is written to `~/.claude/quotaline/`.
+
+Only the weekly window is shown, because it is the only one Codex reports on Pro. Codex has
+been observed starting a fresh weekly window days before the previous one's stated reset,
+so treat "resets in" as an upper bound.
+
 ## Configuration
 
 `refreshInterval` (seconds, in the `statusLine` block) is how often the line re-renders even
@@ -210,6 +242,8 @@ Environment overrides:
 - `QUOTALINE_BIN_DIR` — where the install script puts the binary.
 - `QUOTALINE_DAILY_BUDGET` — USD/day; turns the API-key `day` line into a %-of-budget bar
   with a budget-ETA warning (no effect on subscription sessions).
+- `CODEX_HOME` — where `report --codex` looks for Codex's rollouts (default `~/.codex`), the
+  same variable the Codex CLI reads.
 
 Colour thresholds, bar caps and the sampling/rate windows are compile-time constants at the
 top of the `src` modules — change them and rebuild from source.
