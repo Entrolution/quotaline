@@ -35,9 +35,9 @@ pub fn run(window_min: f64) -> i32 {
         return 0;
     }
 
-    let span = fmt_dur((hist[hist.len() - 1].t - hist[0].t).max(0));
+    let over = over_span(hist[hist.len() - 1].t - hist[0].t);
     println!(
-        "{BOLD}Claude usage — burn rate{RESET}{DIM}  ({} samples over {span}){RESET}",
+        "{BOLD}Claude usage — burn rate{RESET}{DIM}  ({} samples{over}){RESET}",
         hist.len()
     );
     println!();
@@ -140,6 +140,33 @@ fn window_line(label: &str, a: &Analysis, now: f64) -> String {
     line
 }
 
+/// `" over <span>"`, or nothing for a span that isn't positive; see
+/// `codex_header_stats_never_says_now_ago`.
+fn over_span(span_secs: i64) -> String {
+    if span_secs > 0 {
+        format!(" over {}", fmt_dur(span_secs))
+    } else {
+        String::new()
+    }
+}
+
+/// A newest event stamped in the future (clock skew) gets no "last …" clause rather than a
+/// time that can't be true.
+fn codex_header_stats(events: usize, span_secs: i64, since_last_secs: i64) -> String {
+    let noun = if events == 1 { "event" } else { "events" };
+    let mut s = format!(
+        "{} {noun}{}",
+        group_thousands(events as f64),
+        over_span(span_secs)
+    );
+    if since_last_secs > 0 {
+        s.push_str(&format!(", last {} ago", fmt_dur(since_last_secs)));
+    } else if since_last_secs == 0 {
+        s.push_str(", last just now");
+    }
+    s
+}
+
 /// `quotaline report --codex`: the weekly window and token burn rebuilt from Codex's own
 /// rollout logs. No $ section: plan usage is not metered in dollars.
 pub fn run_codex(window_min: f64) -> i32 {
@@ -187,12 +214,8 @@ pub fn run_codex(window_min: f64) -> i32 {
         return 0;
     };
 
-    let span = fmt_dur((last.t - hist[0].t).max(0));
-    let ago = fmt_dur((now - last.t as f64) as i64);
-    println!(
-        "{BOLD}Codex usage — burn rate{RESET}{DIM}  ({} events over {span}, last {ago} ago){RESET}",
-        group_thousands(hist.len() as f64)
-    );
+    let stats = codex_header_stats(hist.len(), last.t - hist[0].t, (now - last.t as f64) as i64);
+    println!("{BOLD}Codex usage — burn rate{RESET}{DIM}  ({stats}){RESET}");
     println!();
 
     match analyze(&hist, Win::SevenDay, window_sec, now) {
@@ -332,5 +355,20 @@ mod tests {
         assert!(line(50.0, Some(10.0), 3_600.0).contains("resets first"));
         let idle = line(50.0, None, 3_600.0);
         assert!(idle.contains("~idle") && !idle.contains("first"), "{idle}");
+    }
+
+    #[test]
+    fn codex_header_stats_never_says_now_ago() {
+        assert_eq!(
+            codex_header_stats(8_640, 601_200, 0),
+            "8,640 events over 6d23h, last just now"
+        );
+        assert_eq!(codex_header_stats(1, 0, 180), "1 event, last 3m ago");
+        assert_eq!(
+            codex_header_stats(2, 30, 30),
+            "2 events over <1m, last <1m ago"
+        );
+        assert_eq!(codex_header_stats(3, 120, -5), "3 events over 2m");
+        assert_eq!(over_span(-5), "");
     }
 }
