@@ -93,6 +93,10 @@ fn reports_rate_and_token_burn() {
     let out = report(&d.0);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "{stdout}");
+    assert!(
+        stdout.contains("(2 events over 1h, last 1m ago)"),
+        "{stdout}"
+    );
     assert!(stdout.contains("+2.0%/hr"), "{stdout}");
     assert!(
         stdout.contains("in 300k · out 4k over the last 2h   ≈152k/hr"),
