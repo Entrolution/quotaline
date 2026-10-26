@@ -17,6 +17,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   own, and Claude's history is untouched. The rate reads idle when Codex logged nothing in
   the rate window, rather than projecting an older burst.
 
+### Fixed
+
+- **`quotaline report` piped into something that stops reading (`| head`) panicked** with a
+  "failed printing to stdout: Broken pipe" error. It now ends quietly, as other command-line
+  tools do, on macOS and Linux. The status line is unaffected.
+- **The report header read "(N samples over now)" when every sample fell in the same second.**
+  The span is now left out when there is none.
+
 ## [1.3.3] - 2026-08-11
 
 ### Fixed

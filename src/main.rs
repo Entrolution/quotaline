@@ -51,6 +51,7 @@ fn main() {
     match args.get(1).map(String::as_str) {
         None => run_statusline(),
         Some("report") => {
+            end_quietly_on_closed_pipe();
             // A non-finite or non-positive window would silently distort every rate fit;
             // fall back to the default rather than presenting garbage as an answer.
             let window = flag_f64(&args, "--window")
@@ -74,6 +75,25 @@ fn main() {
         }
     }
 }
+
+/// Restore SIGPIPE's default so `quotaline report | head` ends when the reader goes away.
+/// The status line keeps it ignored so it still logs its sample: see
+/// `the_status_line_logs_its_sample_into_a_closed_pipe`.
+#[cfg(unix)]
+fn end_quietly_on_closed_pipe() {
+    extern "C" {
+        fn signal(signum: std::ffi::c_int, handler: usize) -> usize;
+    }
+    const SIGPIPE: std::ffi::c_int = 13;
+    const SIG_DFL: usize = 0;
+    // SAFETY: sets one signal back to its default disposition; installs no handler code.
+    unsafe {
+        signal(SIGPIPE, SIG_DFL);
+    }
+}
+
+#[cfg(not(unix))]
+fn end_quietly_on_closed_pipe() {}
 
 fn flag_value<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
     let idx = args.iter().position(|a| a == name)?;
